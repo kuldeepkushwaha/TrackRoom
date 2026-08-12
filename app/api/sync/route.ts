@@ -8,6 +8,7 @@ const redis = new Redis({
   token: process.env.UPSTASH_REDIS_REST_TOKEN!,
 });
 
+
 // ─── Rate limiters ────────────────────────────────────────────────────────────
 const readLimiter = new Ratelimit({
   redis,
@@ -45,7 +46,10 @@ function isValidKey(k: string): boolean {
 }
 
 function validatePasscode(req: NextRequest): boolean {
-  if (!APP_PASSCODE) return true; // no passcode set = open (dev mode)
+   if (!APP_PASSCODE) {
+    console.error("APP_PASSCODE env var is not set — all requests blocked.");
+    return false;
+  }
   const fromHeader = (req.headers.get("x-app-passcode") || "").trim();
   const fromQuery  = (req.nextUrl.searchParams.get("passcode") || "").trim();
   return fromHeader === APP_PASSCODE || fromQuery === APP_PASSCODE;

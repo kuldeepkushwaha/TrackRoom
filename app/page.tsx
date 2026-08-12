@@ -203,57 +203,69 @@ export default function Home() {
 
 
   // ── Push to cloud ──────────────────────────────────────────────────────────
-  const pushToCloud = async (data: YearData, key?: string) => {
-    const k = key || syncKey;
-    if (!k || k.length < 4) return;
+const pushToCloud = async (data: YearData, key?: string) => {
+  const k  = (key || syncKey).trim();
+  if (!k || k.length < 4) return;
 
-    // Use state passcode — not env var
-    const pc = localStorage.getItem("dsa-app-passcode") || appPasscode;
-    if (!pc) {
-      addToast("Enter app passcode first via Sync panel.", "error");
+  const pc = localStorage.getItem("dsa-app-passcode") || appPasscode;
+  if (!pc) {
+    addToast("Enter app passcode first via Sync panel.", "error");
+    return;
+  }
+
+  setSyncStatus("syncing");
+  try {
+    const res = await fetch("/api/sync", {
+      method:  "POST",
+      headers: {
+        "Content-Type":   "application/json",
+        "x-app-passcode": pc,
+      },
+      body: JSON.stringify({ syncKey: k, yearData: data }),
+    });
+
+    const json = await res.json().catch(() => ({}));
+
+    if (res.status === 401) {
+      setPasscodeVerified(false);
+      addToast("Wrong app passcode — re-enter in Sync panel.", "error");
+      setSyncStatus("error");
+      setTimeout(() => setSyncStatus("idle"), 4000);
+      return;
+    }
+    if (res.status === 400) {
+      addToast(`Bad key: ${json?.error || "invalid sync key format"}`, "error");
+      setSyncStatus("error");
+      setTimeout(() => setSyncStatus("idle"), 4000);
+      return;
+    }
+    if (res.status === 403) {
+      addToast("Max sync keys reached. Contact admin.", "error");
+      setSyncStatus("error");
+      setTimeout(() => setSyncStatus("idle"), 4000);
+      return;
+    }
+    if (res.status === 429) {
+      addToast("Too many requests — wait a minute.", "error");
+      setSyncStatus("error");
+      setTimeout(() => setSyncStatus("idle"), 4000);
+      return;
+    }
+    if (!res.ok) {
+      addToast(`Push failed ${res.status}: ${json?.error || "unknown"}`, "error");
+      setSyncStatus("error");
+      setTimeout(() => setSyncStatus("idle"), 4000);
       return;
     }
 
-    setSyncStatus("syncing");
-    try {
-      const res = await fetch("/api/sync", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "x-app-passcode": pc,
-        },
-        body: JSON.stringify({ syncKey: k, yearData: data }),
-      });
-
-      if (res.status === 401) {
-        setPasscodeVerified(false);
-        addToast("Wrong app passcode.", "error");
-        setSyncStatus("error");
-        setTimeout(() => setSyncStatus("idle"), 3000);
-        return;
-      }
-      if (res.status === 403) {
-        addToast("Max sync keys reached. Contact admin.", "error");
-        setSyncStatus("error");
-        setTimeout(() => setSyncStatus("idle"), 3000);
-        return;
-      }
-      if (res.status === 429) {
-        addToast("Too many requests — slow down.", "error");
-        setSyncStatus("error");
-        setTimeout(() => setSyncStatus("idle"), 3000);
-        return;
-      }
-      if (!res.ok) throw new Error("Push failed");
-
-      setSyncStatus("synced");
-      setTimeout(() => setSyncStatus("idle"), 3000);
-    } catch {
-      setSyncStatus("error");
-      addToast("Cloud sync failed — saved locally.", "error");
-      setTimeout(() => setSyncStatus("idle"), 4000);
-    }
-  };
+    setSyncStatus("synced");
+    setTimeout(() => setSyncStatus("idle"), 3000);
+  } catch {
+    setSyncStatus("error");
+    addToast("Cloud sync failed — saved locally.", "error");
+    setTimeout(() => setSyncStatus("idle"), 4000);
+  }
+};
   // ── Persistence ────────────────────────────────────────────────────────────
   const persist = useCallback((next: YearData, skipPush = false) => {
     setYearData(next);
@@ -434,117 +446,142 @@ export default function Home() {
 
 
   // ── Pull from cloud ────────────────────────────────────────────────────────
-  const pullFromCloud = async (key?: string, localData?: YearData) => {
-    const k = key || syncKey;
-    if (!k || k.length < 4) return;
+const pullFromCloud = async (key?: string, localData?: YearData) => {
+  const k  = (key || syncKey).trim();
+  if (!k || k.length < 4) return;
 
-    const pc = localStorage.getItem("dsa-app-passcode") || appPasscode;
-    if (!pc) {
-      addToast("Enter app passcode first via Sync panel.", "error");
+  const pc = localStorage.getItem("dsa-app-passcode") || appPasscode;
+  if (!pc) {
+    addToast("Enter app passcode first via Sync panel.", "error");
+    return;
+  }
+
+  setSyncStatus("syncing");
+  try {
+    const res = await fetch(
+      `/api/sync?key=${encodeURIComponent(k)}`,
+      { headers: { "x-app-passcode": pc } }
+    );
+
+    // Always try to parse the body for error details
+    const json = await res.json().catch(() => ({}));
+
+    if (res.status === 401) {
+      setPasscodeVerified(false);
+      addToast("Wrong app passcode — re-enter in Sync panel.", "error");
+      setSyncStatus("error");
+      setTimeout(() => setSyncStatus("idle"), 4000);
+      return;
+    }
+    if (res.status === 400) {
+      // Show the actual server error message so user knows what's wrong
+      addToast(`Bad key: ${json?.error || "invalid sync key format"}`, "error");
+      setSyncStatus("error");
+      setTimeout(() => setSyncStatus("idle"), 4000);
+      return;
+    }
+    if (res.status === 429) {
+      addToast("Too many requests — wait a minute.", "error");
+      setSyncStatus("error");
+      setTimeout(() => setSyncStatus("idle"), 4000);
+      return;
+    }
+    if (!res.ok) {
+      addToast(`Server error ${res.status}: ${json?.error || "unknown"}`, "error");
+      setSyncStatus("error");
+      setTimeout(() => setSyncStatus("idle"), 4000);
       return;
     }
 
-    setSyncStatus("syncing");
-    try {
-      const res = await fetch(
-        `/api/sync?key=${encodeURIComponent(k)}`,
-        { headers: { "x-app-passcode": pc } }
-      );
+    const { data } = json;
 
-      if (res.status === 401) {
-        setPasscodeVerified(false);
-        addToast("Wrong app passcode.", "error");
-        setSyncStatus("error");
-        setTimeout(() => setSyncStatus("idle"), 3000);
-        return;
+    if (!data) {
+      // Nothing in cloud yet — push local up
+      const existing = localData || yearData;
+      if (Object.keys(existing).length > 0) {
+        await pushToCloud(existing, k);
+        addToast("First sync — local data pushed to cloud ✓", "success");
+      } else {
+        addToast("Sync key ready. Start marking days!", "info");
       }
-      if (res.status === 429) {
-        addToast("Too many requests — slow down.", "error");
-        setSyncStatus("error");
-        setTimeout(() => setSyncStatus("idle"), 3000);
-        return;
-      }
-      if (!res.ok) throw new Error("Pull failed");
-
-      const { data } = await res.json();
-
-      if (!data) {
-        const existing = localData || yearData;
-        if (Object.keys(existing).length > 0) {
-          await pushToCloud(existing, k);
-          addToast("First sync — local data pushed to cloud ✓", "success");
-        } else {
-          addToast("Sync key ready. Start marking days!", "info");
-        }
-        setSyncStatus("synced");
-        setTimeout(() => setSyncStatus("idle"), 3000);
-        return;
-      }
-
-      const cloudData: YearData =
-        typeof data === "string" ? JSON.parse(data) : data;
-      const merged: YearData = { ...(localData || yearData) };
-
-      MONTHS.forEach((m) => {
-        if (!cloudData[m]) return;
-        merged[m] = { ...(merged[m] || {}), ...cloudData[m] };
-      });
-
-      persist(merged);
-
-      const d = merged[selectedMonth]?.[selectedDay];
-      setLearnedInput(d?.learned || "");
-      setDidInput(d?.did || "");
-      setLeakInput(d?.timeLeak || "");
-
-      const totalDays = Object.values(cloudData).reduce(
-        (sum, m) => sum + Object.keys(m).length, 0
-      );
-      addToast(`Synced ${totalDays} day(s) from cloud ✓`, "success");
       setSyncStatus("synced");
       setTimeout(() => setSyncStatus("idle"), 3000);
-    } catch {
-      setSyncStatus("error");
-      addToast("Could not reach cloud — working offline.", "error");
-      setTimeout(() => setSyncStatus("idle"), 4000);
+      return;
     }
-  };
+
+    // Merge cloud → local
+    const cloudData: YearData =
+      typeof data === "string" ? JSON.parse(data) : data;
+    const merged: YearData = { ...(localData || yearData) };
+
+    MONTHS.forEach((m) => {
+      if (!cloudData[m]) return;
+      merged[m] = { ...(merged[m] || {}), ...cloudData[m] };
+    });
+
+    persist(merged);
+
+    const d = merged[selectedMonth]?.[selectedDay];
+    setLearnedInput(d?.learned  || "");
+    setDidInput    (d?.did      || "");
+    setLeakInput   (d?.timeLeak || "");
+
+    const totalDays = Object.values(cloudData).reduce(
+      (sum, m) => sum + Object.keys(m).length, 0
+    );
+    addToast(`Synced ${totalDays} day(s) from cloud ✓`, "success");
+    setSyncStatus("synced");
+    setTimeout(() => setSyncStatus("idle"), 3000);
+  } catch {
+    setSyncStatus("error");
+    addToast("Network error — working offline.", "error");
+    setTimeout(() => setSyncStatus("idle"), 4000);
+  }
+};
   // ── Verify app passcode against server ─────────────────────────────────────
-  const verifyPasscode = async () => {
-    const pc = appPasscodeInput.trim();
-    if (!pc) return;
+const verifyPasscode = async () => {
+  const pc = appPasscodeInput.trim();
+  if (!pc) {
+    setPasscodeError("Enter a passcode first.");
+    return;
+  }
 
-    setPasscodeError("");
-    setSyncStatus("syncing");
+  setPasscodeError("");
+  setSyncStatus("syncing");
 
-    try {
-      // Test the passcode with a harmless GET to a dummy key
-      const res = await fetch(
-        `/api/sync?key=__passcode-check__`,
-        { headers: { "x-app-passcode": pc } }
-      );
+  try {
+    // Hit the dedicated probe endpoint — no key validation involved
+    const res = await fetch("/api/sync?key=__probe__", {
+      headers: { "x-app-passcode": pc },
+    });
 
-      if (res.status === 401) {
-        setPasscodeError("Wrong passcode. Ask your group admin.");
-        setSyncStatus("error");
-        setTimeout(() => setSyncStatus("idle"), 3000);
-        return;
-      }
-
-      // 200 or 400 (bad key format) both mean passcode was accepted
-      if (res.ok || res.status === 400) {
-        setAppPasscode(pc);
-        setPasscodeVerified(true);
-        localStorage.setItem("dsa-app-passcode", pc);
-        setSyncStatus("idle");
-        addToast("App passcode verified ✓", "success");
-        setPasscodeError("");
-      }
-    } catch {
-      setPasscodeError("Network error — check connection.");
-      setSyncStatus("idle");
+    if (res.status === 401) {
+      setPasscodeError("Wrong passcode. Ask your group admin.");
+      setSyncStatus("error");
+      setTimeout(() => setSyncStatus("idle"), 3000);
+      return;
     }
-  };
+
+    if (res.ok) {
+      setAppPasscode(pc);
+      setPasscodeVerified(true);
+      localStorage.setItem("dsa-app-passcode", pc);
+      setSyncStatus("idle");
+      addToast("App passcode verified ✓", "success");
+      setPasscodeError("");
+      return;
+    }
+
+    // Any other error
+    const body = await res.json().catch(() => ({}));
+    setPasscodeError(body?.error || `Unexpected error (${res.status})`);
+    setSyncStatus("error");
+    setTimeout(() => setSyncStatus("idle"), 3000);
+  } catch {
+    setPasscodeError("Network error — check connection.");
+    setSyncStatus("idle");
+  }
+};
 
   // ── Clear app passcode ──────────────────────────────────────────────────────
   const clearPasscode = () => {
@@ -557,18 +594,27 @@ export default function Home() {
     addToast("Passcode cleared.", "info");
   };
   // ── Activate sync key ──────────────────────────────────────────────────────
-  const activateSyncKey = async () => {
-    const k = syncKeyInput.trim().toLowerCase();
-    if (k.length < 4) {
-      addToast("Sync key must be at least 4 characters.", "error");
-      return;
-    }
-    setSyncKey(k);
-    setIsSyncEnabled(true);
-    localStorage.setItem("dsa-sync-key", k);
-    await pullFromCloud(k);
-    setShowSyncPanel(false);
-  };
+const activateSyncKey = async () => {
+  // Sanitize: lowercase, spaces → hyphens, strip invalid chars
+  const k = syncKeyInput
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, "-")
+    .replace(/[^a-z0-9._-]/g, "");
+
+  if (k.length < 4) {
+    addToast("Sync key must be at least 4 characters.", "error");
+    return;
+  }
+
+  // Update input to show sanitized version
+  setSyncKeyInput(k);
+  setSyncKey(k);
+  setIsSyncEnabled(true);
+  localStorage.setItem("dsa-sync-key", k);
+  await pullFromCloud(k);
+  setShowSyncPanel(false);
+};
 
   // ── Disconnect sync ────────────────────────────────────────────────────────
   const disconnectSync = () => {

@@ -9,7 +9,6 @@ const redis = new Redis({
 });
 
 // ─── Rate limiters ────────────────────────────────────────────────────────────
-// Read  — 30 requests per minute per IP
 const readLimiter = new Ratelimit({
   redis,
   limiter:   Ratelimit.slidingWindow(30, "1 m"),
@@ -17,7 +16,6 @@ const readLimiter = new Ratelimit({
   analytics: false,
 });
 
-// Write — 20 requests per minute per IP
 const writeLimiter = new Ratelimit({
   redis,
   limiter:   Ratelimit.slidingWindow(20, "1 m"),
@@ -26,10 +24,10 @@ const writeLimiter = new Ratelimit({
 });
 
 // ─── Constants ────────────────────────────────────────────────────────────────
-const APP_PASSCODE  = process.env.APP_PASSCODE  || "";
+const APP_PASSCODE  = (process.env.APP_PASSCODE || "").trim();
 const MAX_SYNC_KEYS = parseInt(process.env.MAX_SYNC_KEYS || "5", 10);
-const KEY_REGISTRY  = "dsa-war-room:__key-registry__"; // Redis set of all known keys
-const DATA_PREFIX   = "dsa-war-room:data:";            // actual data lives here
+const KEY_REGISTRY  = "dsa-war-room:__registry__";
+const DATA_PREFIX   = "dsa-war-room:data:";
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 function getIP(req: NextRequest): string {
@@ -40,89 +38,104 @@ function getIP(req: NextRequest): string {
   );
 }
 
+// More permissive — allow letters, numbers, hyphens, underscores, dots
+// 4 to 60 chars. Sanitised client-side already.
 function isValidKey(k: string): boolean {
-  // Only lowercase letters, numbers, hyphens, underscores. 4–40 chars.
-  return /^[a-z0-9_-]{4,40}$/.test(k);
+  return /^[a-zA-Z0-9._-]{4,60}$/.test(k);
 }
 
 function validatePasscode(req: NextRequest): boolean {
-  // Accept passcode via header OR query param
-  const header = req.headers.get("x-app-passcode") || "";
-  const query  = req.nextUrl.searchParams.get("passcode") || "";
-  return header === APP_PASSCODE || query === APP_PASSCODE;
+  if (!APP_PASSCODE) return true; // no passcode set = open (dev mode)
+  const fromHeader = (req.headers.get("x-app-passcode") || "").trim();
+  const fromQuery  = (req.nextUrl.searchParams.get("passcode") || "").trim();
+  return fromHeader === APP_PASSCODE || fromQuery === APP_PASSCODE;
 }
 
-// ─── GET — load data ──────────────────────────────────────────────────────────
-export async function GET(req: NextRequest) {
-  const ip = getIP(req);
-
-  // 1. Passcode check
+// ─── Shared pre-flight checks ─────────────────────────────────────────────────
+async function preflight(
+  req: NextRequest,
+  limiter: Ratelimit,
+  syncKey: string | null
+): Promise<NextResponse | null> {
+  // 1. Passcode
   if (!validatePasscode(req)) {
     return NextResponse.json(
-      { error: "Unauthorised — wrong app passcode." },
+      { error: "Wrong app passcode." },
       { status: 401 }
     );
   }
 
   // 2. Rate limit
-  const { success, limit, remaining } = await readLimiter.limit(ip);
+  const ip = getIP(req);
+  const { success } = await limiter.limit(ip);
   if (!success) {
     return NextResponse.json(
-      { error: "Too many requests — slow down." },
-      {
-        status: 429,
-        headers: {
-          "X-RateLimit-Limit":     String(limit),
-          "X-RateLimit-Remaining": String(remaining),
-          "Retry-After":           "60",
-        },
-      }
+      { error: "Too many requests — wait a minute." },
+      { status: 429 }
     );
   }
 
-  // 3. Validate sync key
-  const syncKey = req.nextUrl.searchParams.get("key") || "";
-  if (!isValidKey(syncKey)) {
+  // 3. Key presence
+  if (!syncKey || syncKey.trim() === "") {
     return NextResponse.json(
-      { error: "Invalid key format (4-40 chars, a-z 0-9 - _)" },
+      { error: "No sync key provided." },
       { status: 400 }
     );
   }
 
-  // 4. Fetch data
-  const data = await redis.get(`${DATA_PREFIX}${syncKey}`);
-  return NextResponse.json({ data: data ?? null });
+  // 4. Key format
+  const clean = syncKey.trim();
+  if (clean.length < 4) {
+    return NextResponse.json(
+      { error: `Key too short: "${clean}" (min 4 chars).` },
+      { status: 400 }
+    );
+  }
+  if (clean.length > 60) {
+    return NextResponse.json(
+      { error: "Key too long (max 60 chars)." },
+      { status: 400 }
+    );
+  }
+  if (!isValidKey(clean)) {
+    return NextResponse.json(
+      {
+        error: `Invalid key format: "${clean}". Use only letters, numbers, hyphens, underscores, dots.`,
+      },
+      { status: 400 }
+    );
+  }
+
+  return null; // all good
+}
+
+// ─── GET — load data ──────────────────────────────────────────────────────────
+export async function GET(req: NextRequest) {
+  const syncKey = req.nextUrl.searchParams.get("key");
+
+  // Special passcode-check probe — just validate passcode, skip key checks
+  if (syncKey === "__probe__") {
+    if (!validatePasscode(req)) {
+      return NextResponse.json({ error: "Wrong app passcode." }, { status: 401 });
+    }
+    return NextResponse.json({ ok: true, probe: true });
+  }
+
+  const fail = await preflight(req, readLimiter, syncKey);
+  if (fail) return fail;
+
+  try {
+    const data = await redis.get(`${DATA_PREFIX}${syncKey!.trim()}`);
+    return NextResponse.json({ data: data ?? null });
+  } catch (e) {
+    console.error("Redis GET error:", e);
+    return NextResponse.json({ error: "Redis error." }, { status: 500 });
+  }
 }
 
 // ─── POST — save data ─────────────────────────────────────────────────────────
 export async function POST(req: NextRequest) {
-  const ip = getIP(req);
-
-  // 1. Passcode check
-  if (!validatePasscode(req)) {
-    return NextResponse.json(
-      { error: "Unauthorised — wrong app passcode." },
-      { status: 401 }
-    );
-  }
-
-  // 2. Rate limit
-  const { success, limit, remaining } = await writeLimiter.limit(ip);
-  if (!success) {
-    return NextResponse.json(
-      { error: "Too many requests — slow down." },
-      {
-        status: 429,
-        headers: {
-          "X-RateLimit-Limit":     String(limit),
-          "X-RateLimit-Remaining": String(remaining),
-          "Retry-After":           "60",
-        },
-      }
-    );
-  }
-
-  // 3. Parse body
+  // Parse body first
   let body: { syncKey?: string; yearData?: unknown };
   try {
     body = await req.json();
@@ -130,42 +143,23 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: "Invalid JSON body." }, { status: 400 });
   }
 
-  const { syncKey, yearData } = body;
+  const syncKey = body.syncKey ?? null;
+  const fail    = await preflight(req, writeLimiter, syncKey as string | null);
+  if (fail) return fail;
 
-  // 4. Validate sync key format
-  if (!syncKey || !isValidKey(syncKey)) {
-    return NextResponse.json(
-      { error: "Invalid key format (4-40 chars, a-z 0-9 - _)" },
-      { status: 400 }
-    );
-  }
+  const cleanKey = (syncKey as string).trim();
 
-  // 5. Validate data shape
-  if (!yearData || typeof yearData !== "object" || Array.isArray(yearData)) {
+  // Validate data shape
+  if (
+    !body.yearData ||
+    typeof body.yearData !== "object" ||
+    Array.isArray(body.yearData)
+  ) {
     return NextResponse.json({ error: "Invalid data shape." }, { status: 400 });
   }
 
-  // 6. Check if this is a NEW key — enforce max key limit
-  const isExistingKey = await redis.sismember(KEY_REGISTRY, syncKey);
-
-  if (!isExistingKey) {
-    const totalKeys = await redis.scard(KEY_REGISTRY);
-
-    if (totalKeys >= MAX_SYNC_KEYS) {
-      return NextResponse.json(
-        {
-          error: `Max sync keys reached (${MAX_SYNC_KEYS}). Ask admin to raise the limit or delete unused keys.`,
-        },
-        { status: 403 }
-      );
-    }
-
-    // Register the new key
-    await redis.sadd(KEY_REGISTRY, syncKey);
-  }
-
-  // 7. Validate data size — max 512 KB per key
-  const serialised = JSON.stringify(yearData);
+  // Size limit — 512 KB
+  const serialised = JSON.stringify(body.yearData);
   if (serialised.length > 512 * 1024) {
     return NextResponse.json(
       { error: "Data too large (max 512 KB)." },
@@ -173,8 +167,26 @@ export async function POST(req: NextRequest) {
     );
   }
 
-  // 8. Save
-  await redis.set(`${DATA_PREFIX}${syncKey}`, serialised);
+  try {
+    // Check key registry
+    const isExisting = await redis.sismember(KEY_REGISTRY, cleanKey);
+    if (!isExisting) {
+      const total = await redis.scard(KEY_REGISTRY);
+      if (total >= MAX_SYNC_KEYS) {
+        return NextResponse.json(
+          {
+            error: `Max ${MAX_SYNC_KEYS} sync keys allowed. Ask admin to raise limit.`,
+          },
+          { status: 403 }
+        );
+      }
+      await redis.sadd(KEY_REGISTRY, cleanKey);
+    }
 
-  return NextResponse.json({ ok: true });
+    await redis.set(`${DATA_PREFIX}${cleanKey}`, serialised);
+    return NextResponse.json({ ok: true });
+  } catch (e) {
+    console.error("Redis SET error:", e);
+    return NextResponse.json({ error: "Redis error." }, { status: 500 });
+  }
 }

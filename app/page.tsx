@@ -6,6 +6,10 @@ import {
   TrendingUp, Calendar, Zap, BookOpen, Code2, RotateCcw,
   ChevronsLeft, ChevronsRight, Keyboard, X, ChevronUp,
   Download, Upload,
+  RefreshCw,
+  Cloud,
+  CloudOff,
+  Link,
 } from "lucide-react";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -18,6 +22,7 @@ interface DayData {
 type MonthData = Record<number, DayData>;
 type YearData = Record<string, MonthData>;
 type Toast = { id: number; message: string; type: "success" | "error" | "info" };
+type SyncStatus = "idle" | "syncing" | "synced" | "error";
 
 
 // ─── Constants ────────────────────────────────────────────────────────────────
@@ -93,6 +98,12 @@ export default function Home() {
   const [leftPct, setLeftPct] = useState(DEFAULT_LEFT);
   const [isDragging, setIsDragging] = useState(false);
 
+  const [syncKey,       setSyncKey]       = useState("");
+  const [syncKeyInput,  setSyncKeyInput]  = useState("");
+  const [syncStatus,    setSyncStatus]    = useState<SyncStatus>("idle");
+  const [showSyncPanel, setShowSyncPanel] = useState(false);
+  const [isSyncEnabled, setIsSyncEnabled] = useState(false);
+
   // Refs
   const todayRef = useRef<HTMLDivElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
@@ -102,18 +113,30 @@ export default function Home() {
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   // ── Bootstrap ──────────────────────────────────────────────────────────────
-  useEffect(() => {
-    try {
-      const raw = localStorage.getItem(STORAGE_KEY);
-      const parsed: YearData = raw ? JSON.parse(raw) : {};
-      setYearData(parsed);
-      const d = parsed[TODAY_MONTH]?.[TODAY_DAY];
-      setLearnedInput(d?.learned || "");
-      setDidInput(d?.did || "");
-      setLeakInput(d?.timeLeak || "");
-    } catch { localStorage.removeItem(STORAGE_KEY); }
-    setMounted(true);
-  }, []);
+useEffect(() => {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    const parsed: YearData = raw ? JSON.parse(raw) : {};
+    setYearData(parsed);
+    const d = parsed[TODAY_MONTH]?.[TODAY_DAY];
+    setLearnedInput(d?.learned  || "");
+    setDidInput    (d?.did      || "");
+    setLeakInput   (d?.timeLeak || "");
+
+    // Restore saved sync key and auto-pull if one exists
+    const savedKey = localStorage.getItem("dsa-sync-key");
+    if (savedKey) {
+      setSyncKey(savedKey);
+      setSyncKeyInput(savedKey);
+      setIsSyncEnabled(true);
+      // Auto-pull from cloud on load
+      pullFromCloud(savedKey, parsed);
+    }
+  } catch {
+    localStorage.removeItem(STORAGE_KEY);
+  }
+  setMounted(true);
+}, []);
 
   // ── Auto-scroll to today's month ───────────────────────────────────────────
   useEffect(() => {
@@ -166,12 +189,40 @@ export default function Home() {
     setTimeout(() => setToasts(t => t.filter(x => x.id !== id)), 3000);
   }, []);
 
-  // ── Persistence ────────────────────────────────────────────────────────────
-  const persist = useCallback((next: YearData) => {
-    setYearData(next);
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(next));
-  }, []);
+  
+  // ── Push to cloud ──────────────────────────────────────────────────────────
+const pushToCloud = async (data: YearData, key?: string) => {
+  const k = key || syncKey;
+  if (!k || k.length < 4) return;
 
+  setSyncStatus("syncing");
+  try {
+    const res = await fetch("/api/sync", {
+      method:  "POST",
+      headers: { "Content-Type": "application/json" },
+      body:    JSON.stringify({ syncKey: k, yearData: data }),
+    });
+
+    if (!res.ok) throw new Error("Push failed");
+
+    setSyncStatus("synced");
+    setTimeout(() => setSyncStatus("idle"), 3000);
+  } catch {
+    setSyncStatus("error");
+    addToast("Cloud sync failed — data still saved locally.", "error");
+    setTimeout(() => setSyncStatus("idle"), 4000);
+  }
+};
+  // ── Persistence ────────────────────────────────────────────────────────────
+const persist = useCallback((next: YearData, skipPush = false) => {
+  setYearData(next);
+  localStorage.setItem(STORAGE_KEY, JSON.stringify(next));
+  // Auto-push to cloud if sync is enabled
+  if (!skipPush) {
+    const k = localStorage.getItem("dsa-sync-key");
+    if (k) pushToCloud(next, k);
+  }
+}, []);
   const updateStatus = useCallback((month: string, day: number, status: "succeed" | "wasted") => {
     setYearData(prev => {
       const existing = prev[month]?.[day] ?? { learned: "", did: "", timeLeak: "" };
@@ -340,6 +391,87 @@ export default function Home() {
     reader.readAsText(file);
   };
 
+
+// ── Pull from cloud ────────────────────────────────────────────────────────
+const pullFromCloud = async (key?: string, localData?: YearData) => {
+  const k = key || syncKey;
+  if (!k || k.length < 4) return;
+
+  setSyncStatus("syncing");
+  try {
+    const res = await fetch(`/api/sync?key=${encodeURIComponent(k)}`);
+    if (!res.ok) throw new Error("Pull failed");
+
+    const { data } = await res.json();
+
+    if (!data) {
+      // Nothing in cloud yet — push local data up
+      const existing = localData || yearData;
+      if (Object.keys(existing).length > 0) {
+        await pushToCloud(existing, k);
+        addToast("First sync — local data pushed to cloud ✓", "success");
+      } else {
+        addToast("Sync key ready. Start marking days!", "info");
+      }
+      setSyncStatus("synced");
+      setTimeout(() => setSyncStatus("idle"), 3000);
+      return;
+    }
+
+    // Merge: cloud wins on conflict
+    const cloudData: YearData = typeof data === "string" ? JSON.parse(data) : data;
+    const base = localData || yearData;
+    const merged: YearData = { ...base };
+
+    MONTHS.forEach((m) => {
+      if (!cloudData[m]) return;
+      merged[m] = { ...(merged[m] || {}), ...cloudData[m] };
+    });
+
+    persist(merged);
+
+    const d = merged[selectedMonth]?.[selectedDay];
+    setLearnedInput(d?.learned  || "");
+    setDidInput    (d?.did      || "");
+    setLeakInput   (d?.timeLeak || "");
+
+    const totalDays = Object.values(cloudData)
+      .reduce((sum, m) => sum + Object.keys(m).length, 0);
+
+    addToast(`Synced ${totalDays} day(s) from cloud ✓`, "success");
+    setSyncStatus("synced");
+    setTimeout(() => setSyncStatus("idle"), 3000);
+  } catch {
+    setSyncStatus("error");
+    addToast("Could not reach cloud — working offline.", "error");
+    setTimeout(() => setSyncStatus("idle"), 4000);
+  }
+};
+
+// ── Activate sync key ──────────────────────────────────────────────────────
+const activateSyncKey = async () => {
+  const k = syncKeyInput.trim().toLowerCase();
+  if (k.length < 4) {
+    addToast("Sync key must be at least 4 characters.", "error");
+    return;
+  }
+  setSyncKey(k);
+  setIsSyncEnabled(true);
+  localStorage.setItem("dsa-sync-key", k);
+  await pullFromCloud(k);
+  setShowSyncPanel(false);
+};
+
+// ── Disconnect sync ────────────────────────────────────────────────────────
+const disconnectSync = () => {
+  setSyncKey("");
+  setSyncKeyInput("");
+  setIsSyncEnabled(false);
+  setSyncStatus("idle");
+  localStorage.removeItem("dsa-sync-key");
+  addToast("Cloud sync disconnected. Data still saved locally.", "info");
+};
+
   // ── Keyboard shortcuts ─────────────────────────────────────────────────────
   useEffect(() => {
     if (!mounted) return;
@@ -461,6 +593,98 @@ export default function Home() {
         </div>
       )}
 
+      {/* ── SYNC PANEL MODAL ─────────────────────────────────────────────────────── */}
+{showSyncPanel && (
+  <div
+    className="fixed inset-0 z-[90] bg-slate-950/80 backdrop-blur-sm flex items-center justify-center p-4"
+    onClick={() => setShowSyncPanel(false)}
+  >
+    <div
+      className="bg-slate-900 border border-slate-700 rounded-2xl p-6 w-full max-w-md shadow-2xl space-y-5"
+      onClick={e => e.stopPropagation()}
+    >
+      {/* Header */}
+      <div className="flex items-center justify-between">
+        <h3 className="text-sm font-black uppercase tracking-widest text-white flex items-center gap-2">
+          <Cloud size={14} className="text-blue-400" /> Cloud Sync
+        </h3>
+        <button
+          onClick={() => setShowSyncPanel(false)}
+          className="text-slate-600 hover:text-slate-300 transition-colors"
+        >
+          <X size={16} />
+        </button>
+      </div>
+
+      {/* Explainer */}
+      <div className="bg-slate-800/50 border border-slate-700 rounded-xl p-4 space-y-1.5">
+        <p className="text-[10px] font-black text-slate-300 uppercase tracking-wider">How it works</p>
+        <p className="text-[11px] text-slate-500 leading-relaxed">
+          Pick any secret key (like a password). Your data saves to the cloud under that key.
+          Open the app on any device, enter the same key → your data appears.
+        </p>
+        <p className="text-[10px] text-orange-400 font-bold mt-2">
+          ⚠ Anyone with your key can read your data — keep it private.
+        </p>
+      </div>
+
+      {/* Current status */}
+      {isSyncEnabled ? (
+        <div className="bg-emerald-950/40 border border-emerald-600/30 rounded-xl p-4 space-y-3">
+          <div className="flex items-center justify-between">
+            <div>
+              <p className="text-[9px] font-black text-emerald-400 uppercase tracking-widest">Active Sync Key</p>
+              <p className="text-lg font-black text-white mt-0.5 font-mono tracking-widest">{syncKey}</p>
+            </div>
+            <CheckCircle size={20} className="text-emerald-400" />
+          </div>
+          <p className="text-[10px] text-slate-500">
+            Use this exact key on your other devices to access the same data.
+          </p>
+          <div className="flex gap-2">
+            <button
+              onClick={() => pullFromCloud()}
+              className="flex-1 flex items-center justify-center gap-1.5 py-2 rounded-xl bg-blue-600 hover:bg-blue-500 text-white text-[10px] font-black uppercase tracking-wider transition-all"
+            >
+              <RefreshCw size={10} /> Pull from Cloud
+            </button>
+            <button
+              onClick={disconnectSync}
+              className="flex items-center justify-center gap-1.5 px-3 py-2 rounded-xl bg-rose-500/10 border border-rose-500/25 text-rose-400 hover:bg-rose-500/20 text-[10px] font-black uppercase tracking-wider transition-all"
+            >
+              <CloudOff size={10} /> Disconnect
+            </button>
+          </div>
+        </div>
+      ) : (
+        <div className="space-y-3">
+          <div>
+            <label className="text-[9px] font-black text-slate-400 uppercase tracking-widest block mb-1.5">
+              Enter your sync key
+            </label>
+            <input
+              type="text"
+              value={syncKeyInput}
+              onChange={e => setSyncKeyInput(e.target.value.toLowerCase())}
+              onKeyDown={e => e.key === "Enter" && activateSyncKey()}
+              placeholder="e.g. myname-dsa-2026"
+              className="w-full bg-slate-950 border border-slate-800 focus:border-blue-500/60 rounded-xl px-4 py-3 text-sm font-black text-white focus:outline-none placeholder:text-slate-700 tracking-wider"
+              autoFocus
+            />
+            <p className="text-[9px] text-slate-600 mt-1">Min 4 characters. Lowercase. No spaces (use - or _).</p>
+          </div>
+          <button
+            onClick={activateSyncKey}
+            className="w-full flex items-center justify-center gap-2 py-3 rounded-xl bg-blue-600 hover:bg-blue-500 text-white text-xs font-black uppercase tracking-widest transition-all"
+          >
+            <Link size={12} /> Activate Sync Key
+          </button>
+        </div>
+      )}
+    </div>
+  </div>
+)}
+
       {/* ── STICKY HEADER ────────────────────────────────────────────────────── */}
       <header className="shrink-0 bg-slate-950/95 backdrop-blur-md border-b border-slate-800/80 px-4 py-3 z-40">
         <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
@@ -470,6 +694,25 @@ export default function Home() {
               <h1 className="text-base font-black uppercase tracking-tight text-white">
                 DSA War Room <span className="text-blue-500">{YEAR}</span>
               </h1>
+              {/* Cloud Sync button */}
+<button
+  onClick={() => setShowSyncPanel(v => !v)}
+  className={`text-[9px] font-black uppercase tracking-widest px-2 py-1 rounded-lg border transition-all flex items-center gap-1 ${
+    syncStatus === "syncing" ? "bg-blue-500/20 border-blue-500/50 text-blue-400 animate-pulse" :
+    syncStatus === "synced"  ? "bg-emerald-500/20 border-emerald-500/40 text-emerald-400" :
+    syncStatus === "error"   ? "bg-rose-500/20 border-rose-500/40 text-rose-400" :
+    isSyncEnabled            ? "bg-emerald-500/10 border-emerald-500/25 text-emerald-400 hover:bg-emerald-500/20" :
+                               "bg-slate-800 border-slate-700 text-slate-500 hover:text-slate-300"
+  }`}
+>
+  {syncStatus === "syncing" ? <RefreshCw size={9} className="animate-spin" /> :
+   isSyncEnabled            ? <Cloud size={9} /> :
+                              <CloudOff size={9} />}
+  {syncStatus === "syncing" ? "Syncing..." :
+   syncStatus === "synced"  ? "Synced ✓" :
+   syncStatus === "error"   ? "Sync Error" :
+   isSyncEnabled            ? "Cloud On" : "Sync"}
+</button>
               {/* Download backup */}
               <button
                 onClick={downloadBackup}

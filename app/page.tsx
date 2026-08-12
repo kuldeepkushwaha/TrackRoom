@@ -806,15 +806,12 @@ const disconnectSync = () => {
           Loading War Room...
         </p>
         <p className="text-slate-600 text-[10px]">
-          {localStorage.getItem("dsa-sync-key")
-            ? "Pulling latest data from cloud..."
-            : "Loading local data..."}
+          Syncing your data...
         </p>
       </div>
     </div>
   </div>
 );
-
   // ── Computed stats ─────────────────────────────────────────────────────────
   let globalWins = 0, globalLosses = 0;
   Object.values(yearData).forEach(m => Object.values(m).forEach(d => {

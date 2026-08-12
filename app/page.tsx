@@ -1,69 +1,951 @@
-import Image from "next/image";
+"use client";
 
+import { useState, useEffect, useRef, useCallback } from "react";
+import {
+  CheckCircle, XCircle, Flame, Clock, ShieldAlert, Trophy,
+  TrendingUp, Calendar, Zap, BookOpen, Code2, RotateCcw,
+  ChevronsLeft, ChevronsRight, Keyboard, X, ChevronUp,
+  Download, Upload,
+} from "lucide-react";
+
+// ─── Types ────────────────────────────────────────────────────────────────────
+interface DayData {
+  status: "succeed" | "wasted";
+  learned: string;
+  did: string;
+  timeLeak: string;
+}
+type MonthData = Record<number, DayData>;
+type YearData = Record<string, MonthData>;
+type Toast = { id: number; message: string; type: "success" | "error" | "info" };
+
+
+// ─── Constants ────────────────────────────────────────────────────────────────
+const MONTHS = [
+  "January", "February", "March", "April", "May", "June",
+  "July", "August", "September", "October", "November", "December",
+];
+const STORAGE_KEY = "dsa-war-room-v5";
+const YEAR = new Date().getFullYear();
+const TODAY = new Date();
+const TODAY_MONTH = MONTHS[TODAY.getMonth()];
+const TODAY_DAY = TODAY.getDate();
+const TODAY_M_IDX = TODAY.getMonth();
+const MIN_LEFT_PX = 420;
+const MAX_LEFT_PX = 1200;
+const DEFAULT_LEFT = 68; // percent
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+const getDaysInMonth = (mi: number) => new Date(YEAR, mi + 1, 0).getDate();
+const getFirstDayOffset = (mi: number) => { const d = new Date(YEAR, mi, 1).getDay(); return d === 0 ? 6 : d - 1; };
+const getDayOfYear = () => Math.floor((TODAY.getTime() - new Date(YEAR, 0, 0).getTime()) / 86_400_000);
+
+function getCurrentStreak(yd: YearData): number {
+  let streak = 0;
+  const d = new Date(YEAR, TODAY_M_IDX, TODAY_DAY);
+  while (true) {
+    const m = MONTHS[d.getMonth()]; const day = d.getDate();
+    if (yd[m]?.[day]?.status === "succeed") { streak++; d.setDate(d.getDate() - 1); } else break;
+  }
+  return streak;
+}
+function getBestStreak(yd: YearData): number {
+  let best = 0, cur = 0;
+  for (let m = 0; m < 12; m++) for (let d = 1; d <= getDaysInMonth(m); d++) {
+    const s = yd[MONTHS[m]]?.[d]?.status;
+    if (s === "succeed") { cur++; best = Math.max(best, cur); } else if (s === "wasted") cur = 0;
+  }
+  return best;
+}
+function getMonthStats(yd: YearData, month: string) {
+  const data = Object.values(yd[month] || {});
+  const wins = data.filter(d => d.status === "succeed").length;
+  const losses = data.filter(d => d.status === "wasted").length;
+  return { wins, losses, rate: wins + losses > 0 ? Math.round((wins / (wins + losses)) * 100) : null };
+}
+function getReality(wins: number, losses: number, streak: number, winRate: number, todayStatus?: string) {
+  const total = wins + losses;
+  if (!todayStatus) return { text: "⚠ TODAY UNMARKED — mark it before midnight. No blank days ever.", color: "text-orange-400" };
+  if (streak >= 30) return { text: `🔥 ${streak}-DAY STREAK. You are not the same person. Don't stop.`, color: "text-emerald-300" };
+  if (streak >= 14) return { text: `🔥 ${streak} days straight. This is identity now. Protect it.`, color: "text-emerald-400" };
+  if (streak >= 7) return { text: `${streak}-day streak. ONE skip resets everything. Every. Single. Day.`, color: "text-emerald-400" };
+  if (streak >= 3) return { text: `${streak} days building. Don't romanticise it — just keep going.`, color: "text-yellow-400" };
+  if (winRate < 30 && total > 10) return { text: `Win rate: ${winRate}%. Brain is winning. Fight harder today.`, color: "text-rose-400" };
+  if (todayStatus === "wasted") return { text: "Today: WASTED. Reclaim 1 hour tonight. Don't write off the day.", color: "text-rose-400" };
+  return { text: "Today: WIN ✓  Chain alive. Log what you learned before sleep.", color: "text-emerald-400" };
+}
+
+// ─── Component ────────────────────────────────────────────────────────────────
 export default function Home() {
+  const [yearData, setYearData] = useState<YearData>({});
+  const [selectedMonth, setSelectedMonth] = useState(TODAY_MONTH);
+  const [selectedDay, setSelectedDay] = useState(TODAY_DAY);
+  const [learnedInput, setLearnedInput] = useState("");
+  const [didInput, setDidInput] = useState("");
+  const [leakInput, setLeakInput] = useState("");
+  const [saveState, setSaveState] = useState<"idle" | "saved">("idle");
+  const [mounted, setMounted] = useState(false);
+  const [confirmReset, setConfirmReset] = useState(false);
+  const [toasts, setToasts] = useState<Toast[]>([]);
+  const [showShortcuts, setShowShortcuts] = useState(false);
+  const [mobileView, setMobileView] = useState<"calendar" | "log">("calendar");
+  const [showScrollTop, setShowScrollTop] = useState(false);
+  const [leftPct, setLeftPct] = useState(DEFAULT_LEFT);
+  const [isDragging, setIsDragging] = useState(false);
+
+  // Refs
+  const todayRef = useRef<HTMLDivElement>(null);
+  const containerRef = useRef<HTMLDivElement>(null);
+  const dragRef = useRef<{ startX: number; startPct: number } | null>(null);
+  const calScrollRef = useRef<HTMLDivElement>(null);
+  const toastCounter = useRef(0);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
+  // ── Bootstrap ──────────────────────────────────────────────────────────────
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem(STORAGE_KEY);
+      const parsed: YearData = raw ? JSON.parse(raw) : {};
+      setYearData(parsed);
+      const d = parsed[TODAY_MONTH]?.[TODAY_DAY];
+      setLearnedInput(d?.learned || "");
+      setDidInput(d?.did || "");
+      setLeakInput(d?.timeLeak || "");
+    } catch { localStorage.removeItem(STORAGE_KEY); }
+    setMounted(true);
+  }, []);
+
+  // ── Auto-scroll to today's month ───────────────────────────────────────────
+  useEffect(() => {
+    if (!mounted) return;
+    // Small delay so layout has settled
+    const t = setTimeout(() => {
+      todayRef.current?.scrollIntoView({ behavior: "smooth", block: "center" });
+    }, 300);
+    return () => clearTimeout(t);
+  }, [mounted]);
+
+  // ── Scroll-to-top button visibility ───────────────────────────────────────
+  useEffect(() => {
+    const el = calScrollRef.current;
+    if (!el) return;
+    const onScroll = () => setShowScrollTop(el.scrollTop > 400);
+    el.addEventListener("scroll", onScroll);
+    return () => el.removeEventListener("scroll", onScroll);
+  }, [mounted]);
+
+  // ── Resizable divider (mouse) ──────────────────────────────────────────────
+  const onDividerMouseDown = (e: React.MouseEvent) => {
+    e.preventDefault();
+    dragRef.current = { startX: e.clientX, startPct: leftPct };
+    setIsDragging(true);
+  };
+  useEffect(() => {
+    if (!isDragging) return;
+    const onMove = (e: MouseEvent) => {
+      if (!dragRef.current || !containerRef.current) return;
+      const containerW = containerRef.current.getBoundingClientRect().width;
+      const delta = e.clientX - dragRef.current.startX;
+      const deltaPct = (delta / containerW) * 100;
+      const newPct = Math.min(
+        Math.max(dragRef.current.startPct + deltaPct, (MIN_LEFT_PX / containerW) * 100),
+        (MAX_LEFT_PX / containerW) * 100,
+      );
+      setLeftPct(newPct);
+    };
+    const onUp = () => { setIsDragging(false); dragRef.current = null; };
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+    return () => { window.removeEventListener("mousemove", onMove); window.removeEventListener("mouseup", onUp); };
+  }, [isDragging]);
+
+  // ── Toast system ───────────────────────────────────────────────────────────
+  const addToast = useCallback((message: string, type: Toast["type"] = "success") => {
+    const id = ++toastCounter.current;
+    setToasts(t => [...t, { id, message, type }]);
+    setTimeout(() => setToasts(t => t.filter(x => x.id !== id)), 3000);
+  }, []);
+
+  // ── Persistence ────────────────────────────────────────────────────────────
+  const persist = useCallback((next: YearData) => {
+    setYearData(next);
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(next));
+  }, []);
+
+  const updateStatus = useCallback((month: string, day: number, status: "succeed" | "wasted") => {
+    setYearData(prev => {
+      const existing = prev[month]?.[day] ?? { learned: "", did: "", timeLeak: "" };
+      const next = { ...prev, [month]: { ...(prev[month] || {}), [day]: { ...existing, status } } };
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(next));
+      return next;
+    });
+    addToast(status === "succeed" ? `${month} ${day} → WIN ✓` : `${month} ${day} → Wasted logged`, status === "succeed" ? "success" : "error");
+  }, [addToast]);
+
+  const saveAudit = useCallback(() => {
+    if (!selectedMonth || selectedDay === null) return;
+    setYearData(prev => {
+      const existing = prev[selectedMonth]?.[selectedDay] ?? { status: "wasted" as const };
+      const next = {
+        ...prev,
+        [selectedMonth]: {
+          ...(prev[selectedMonth] || {}),
+          [selectedDay]: { ...existing, learned: learnedInput, did: didInput, timeLeak: leakInput },
+        },
+      };
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(next));
+      return next;
+    });
+    setSaveState("saved");
+    addToast("Audit committed to disk ✓", "success");
+    setTimeout(() => setSaveState("idle"), 2500);
+  }, [selectedMonth, selectedDay, learnedInput, didInput, leakInput, addToast]);
+
+  const selectDay = useCallback((month: string, day: number, yd?: YearData) => {
+    const data = yd || yearData;
+    setSelectedMonth(month);
+    setSelectedDay(day);
+    const d = data[month]?.[day];
+    setLearnedInput(d?.learned || "");
+    setDidInput(d?.did || "");
+    setLeakInput(d?.timeLeak || "");
+    setMobileView("log");
+  }, [yearData]);
+
+  const jumpToToday = () => {
+    selectDay(TODAY_MONTH, TODAY_DAY);
+    setTimeout(() => todayRef.current?.scrollIntoView({ behavior: "smooth", block: "center" }), 50);
+    setMobileView("calendar");
+  };
+  // ── Reset only the selected day ────────────────────────────────────────────
+  const resetCurrentDay = () => {
+    if (!confirmReset) {
+      setConfirmReset(true);
+      setTimeout(() => setConfirmReset(false), 3000);
+      return;
+    }
+
+    // Remove this day's entry completely from yearData
+    const updatedMonth = { ...(yearData[selectedMonth] || {}) };
+    delete updatedMonth[selectedDay];
+
+    const updated = { ...yearData, [selectedMonth]: updatedMonth };
+
+    // Clean up empty month key
+    if (Object.keys(updatedMonth).length === 0) {
+      delete updated[selectedMonth];
+    }
+
+    persist(updated);
+
+    // Clear audit fields
+    setLearnedInput("");
+    setDidInput("");
+    setLeakInput("");
+    setConfirmReset(false);
+
+    addToast(`${selectedMonth} ${selectedDay} cleared.`, "info");
+  };
+  // ── Export JSON backup ─────────────────────────────────────────────────────
+  const downloadBackup = () => {
+    if (Object.keys(yearData).length === 0) {
+      addToast("Nothing to backup yet — mark some days first.", "info");
+      return;
+    }
+
+    const payload = {
+      version: "dsa-war-room-v5",
+      exportedAt: new Date().toISOString(),
+      year: YEAR,
+      data: yearData,
+    };
+
+    const blob = new Blob([JSON.stringify(payload, null, 2)], {
+      type: "application/json",
+    });
+
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    const date = new Date().toISOString().slice(0, 10); // 2026-01-25
+
+    a.href = url;
+    a.download = `dsa-warroom-backup-${YEAR}-${date}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+
+    addToast("Backup downloaded ✓", "success");
+  };
+
+  // ── Import JSON backup ─────────────────────────────────────────────────────
+  const loadBackup = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    // Reset input so same file can be re-selected if needed
+    e.target.value = "";
+
+    const reader = new FileReader();
+
+    reader.onload = (ev) => {
+      try {
+        const raw = ev.target?.result as string;
+        const parsed = JSON.parse(raw);
+
+        // ── Validate shape ────────────────────────────────────────────────────
+        // Accept both raw YearData and our wrapped payload format
+        let imported: YearData;
+
+        if (parsed?.version === "dsa-war-room-v5" && parsed?.data) {
+          // Our own export format
+          imported = parsed.data as YearData;
+        } else if (typeof parsed === "object" && !Array.isArray(parsed)) {
+          // Maybe a raw YearData dump — do a quick sanity check
+          const keys = Object.keys(parsed);
+          const looksValid = keys.length === 0 || keys.some(k => MONTHS.includes(k));
+          if (!looksValid) throw new Error("Unrecognised file format.");
+          imported = parsed as YearData;
+        } else {
+          throw new Error("Unrecognised file format.");
+        }
+
+        // ── Merge strategy: imported data wins for any conflicting day ────────
+        const merged: YearData = { ...yearData };
+
+        MONTHS.forEach((m) => {
+          if (!imported[m]) return;
+          merged[m] = { ...(merged[m] || {}), ...imported[m] };
+        });
+
+        persist(merged);
+
+        // Refresh audit panel fields for currently selected day
+        const d = merged[selectedMonth]?.[selectedDay];
+        setLearnedInput(d?.learned || "");
+        setDidInput(d?.did || "");
+        setLeakInput(d?.timeLeak || "");
+
+        const totalDays = Object.values(imported)
+          .reduce((sum, m) => sum + Object.keys(m).length, 0);
+
+        addToast(`Loaded ${totalDays} day(s) from backup ✓`, "success");
+      } catch (err) {
+        addToast(
+          err instanceof Error ? `Import failed: ${err.message}` : "Import failed — invalid file.",
+          "error",
+        );
+      }
+    };
+
+    reader.onerror = () => addToast("Could not read file.", "error");
+    reader.readAsText(file);
+  };
+
+  // ── Keyboard shortcuts ─────────────────────────────────────────────────────
+  useEffect(() => {
+    if (!mounted) return;
+    const onKey = (e: KeyboardEvent) => {
+      const tag = (e.target as HTMLElement).tagName.toLowerCase();
+      if (tag === "textarea" || tag === "input") return; // don't hijack typing
+
+      switch (e.key.toLowerCase()) {
+        case "w": updateStatus(selectedMonth, selectedDay, "succeed"); break;
+        case "l": updateStatus(selectedMonth, selectedDay, "wasted"); break;
+        case "s": if (e.ctrlKey || e.metaKey) { e.preventDefault(); saveAudit(); } break;
+        case "t": jumpToToday(); break;
+        case "?": setShowShortcuts(v => !v); break;
+        case "escape": setShowShortcuts(false); break;
+        case "arrowleft": {
+          // previous day
+          const d = new Date(YEAR, MONTHS.indexOf(selectedMonth), selectedDay - 1);
+          if (d.getFullYear() === YEAR) selectDay(MONTHS[d.getMonth()], d.getDate());
+          break;
+        }
+        case "arrowright": {
+          // next day (not future)
+          const d = new Date(YEAR, MONTHS.indexOf(selectedMonth), selectedDay + 1);
+          const isFuture = d > TODAY;
+          if (d.getFullYear() === YEAR && !isFuture) selectDay(MONTHS[d.getMonth()], d.getDate());
+          break;
+        }
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [mounted, selectedMonth, selectedDay, updateStatus, saveAudit, selectDay]);
+
+  if (!mounted) return (
+    <div className="min-h-screen bg-slate-950 flex items-center justify-center">
+      <div className="flex flex-col items-center gap-3">
+        <div className="w-8 h-8 border-2 border-blue-500 border-t-transparent rounded-full animate-spin" />
+        <p className="text-slate-500 text-xs font-black uppercase tracking-widest">Loading War Room...</p>
+      </div>
+    </div>
+  );
+
+  // ── Computed stats ─────────────────────────────────────────────────────────
+  let globalWins = 0, globalLosses = 0;
+  Object.values(yearData).forEach(m => Object.values(m).forEach(d => {
+    if (d.status === "succeed") globalWins++;
+    if (d.status === "wasted") globalLosses++;
+  }));
+  const currentStreak = getCurrentStreak(yearData);
+  const bestStreak = getBestStreak(yearData);
+  const daysLeft = 365 - getDayOfYear();
+  const totalMarked = globalWins + globalLosses;
+  const winRate = totalMarked > 0 ? Math.round((globalWins / totalMarked) * 100) : 0;
+  const todayStatus = yearData[TODAY_MONTH]?.[TODAY_DAY]?.status;
+  const reality = getReality(globalWins, globalLosses, currentStreak, winRate, todayStatus);
+  const selectedDayData = yearData[selectedMonth]?.[selectedDay];
+  const isSelectedToday = selectedMonth === TODAY_MONTH && selectedDay === TODAY_DAY;
+
+  // ─────────────────────────────────────────────────────────────────────────
   return (
-    <div className="flex flex-col flex-1 items-center justify-center bg-zinc-50 font-sans dark:bg-black">
-      <main className="flex flex-1 w-full max-w-3xl flex-col items-center justify-between py-32 px-16 bg-white dark:bg-black sm:items-start">
-        <Image
-          className="dark:invert h-5 w-[100px]"
-          src="/next.svg"
-          alt="Next.js logo"
-          width={100}
-          height={20}
-          priority
-        />
-        <div className="flex flex-col items-center gap-6 text-center sm:items-start sm:text-left">
-          <h1 className="max-w-xs text-3xl font-semibold leading-10 tracking-tight text-black dark:text-zinc-50">
-            To get started, edit the{" "}
-            <code className="rounded bg-black/[.06] px-1.5 py-0.5 font-mono text-[0.9em] dark:bg-white/[.08]">
-              page.tsx
-            </code>{" "}
-            file.
-          </h1>
-          <p className="max-w-md text-lg leading-8 text-zinc-600 dark:text-zinc-400">
-            Looking for a starting point or more instructions? Head over to{" "}
-            <a
-              href="https://vercel.com/templates?framework=next.js&utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Templates
-            </a>{" "}
-            or the{" "}
-            <a
-              href="https://nextjs.org/learn?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Learning
-            </a>{" "}
-            center.
-          </p>
-        </div>
-        <div className="flex flex-col gap-4 text-base font-medium sm:flex-row">
-          <a
-            className="flex h-12 w-full items-center justify-center gap-2 rounded-full bg-foreground px-5 text-background transition-colors hover:bg-[#383838] dark:hover:bg-[#ccc] md:w-[158px]"
-            href="https://vercel.com/new?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
+    <div className="h-screen flex flex-col bg-slate-950 text-slate-100 overflow-hidden">
+      <input
+        ref={fileInputRef}
+        type="file"
+        accept=".json,application/json"
+        className="hidden"
+        onChange={loadBackup}
+      />
+      {/* ── TOAST STACK ────────────────────────────────────────────────────── */}
+      <div className="fixed bottom-6 right-6 z-[100] flex flex-col gap-2 pointer-events-none">
+        {toasts.map(t => (
+          <div
+            key={t.id}
+            className={`flex items-center gap-2.5 px-4 py-2.5 rounded-xl text-xs font-black border shadow-2xl backdrop-blur-md animate-in slide-in-from-bottom-2 fade-in duration-200 pointer-events-auto ${t.type === "success" ? "bg-emerald-950/90 border-emerald-600/50 text-emerald-300" :
+                t.type === "error" ? "bg-rose-950/90    border-rose-600/50    text-rose-300" :
+                  "bg-slate-800/90   border-slate-600/50   text-slate-300"
+              }`}
           >
-            <Image
-              className="dark:invert h-[14px] w-4"
-              src="/vercel.svg"
-              alt="Vercel logomark"
-              width={16}
-              height={14}
-            />
-            Deploy Now
-          </a>
-          <a
-            className="flex h-12 w-full items-center justify-center rounded-full border border-solid border-black/[.08] px-5 transition-colors hover:border-transparent hover:bg-black/[.04] dark:border-white/[.145] dark:hover:bg-[#1a1a1a] md:w-[158px]"
-            href="https://nextjs.org/docs?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            Documentation
-          </a>
+            {t.type === "success" ? <CheckCircle size={12} /> : t.type === "error" ? <XCircle size={12} /> : <Zap size={12} />}
+            {t.message}
+          </div>
+        ))}
+      </div>
+
+      {/* ── KEYBOARD SHORTCUTS MODAL ────────────────────────────────────────── */}
+      {showShortcuts && (
+        <div className="fixed inset-0 z-[90] bg-slate-950/80 backdrop-blur-sm flex items-center justify-center p-4"
+          onClick={() => setShowShortcuts(false)}>
+          <div className="bg-slate-900 border border-slate-700 rounded-2xl p-6 w-full max-w-sm shadow-2xl"
+            onClick={e => e.stopPropagation()}>
+            <div className="flex items-center justify-between mb-5">
+              <h3 className="text-sm font-black uppercase tracking-widest text-white flex items-center gap-2">
+                <Keyboard size={14} className="text-blue-400" /> Shortcuts
+              </h3>
+              <button onClick={() => setShowShortcuts(false)}
+                className="text-slate-600 hover:text-slate-300 transition-colors">
+                <X size={16} />
+              </button>
+            </div>
+            <div className="space-y-2">
+              {[
+                ["W", "Mark today → WIN"],
+                ["L", "Mark today → WASTED"],
+                ["Ctrl + S", "Save audit log"],
+                ["T", "Jump to Today"],
+                ["← →", "Previous / Next day"],
+                ["?", "Toggle this panel"],
+                ["Esc", "Close modal"],
+              ].map(([key, desc]) => (
+                <div key={key} className="flex items-center justify-between">
+                  <span className="text-[11px] text-slate-400">{desc}</span>
+                  <kbd className="text-[10px] font-black bg-slate-800 border border-slate-700 text-slate-300 px-2 py-0.5 rounded-lg">
+                    {key}
+                  </kbd>
+                </div>
+              ))}
+            </div>
+          </div>
         </div>
-      </main>
+      )}
+
+      {/* ── STICKY HEADER ────────────────────────────────────────────────────── */}
+      <header className="shrink-0 bg-slate-950/95 backdrop-blur-md border-b border-slate-800/80 px-4 py-3 z-40">
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+          {/* Title + reality */}
+          <div className="min-w-0">
+            <div className="flex items-center gap-2 flex-wrap">
+              <h1 className="text-base font-black uppercase tracking-tight text-white">
+                DSA War Room <span className="text-blue-500">{YEAR}</span>
+              </h1>
+              {/* Download backup */}
+              <button
+                onClick={downloadBackup}
+                className="text-[9px] font-black uppercase tracking-widest px-2 py-1 rounded-lg border
+                  bg-emerald-500/10 border-emerald-500/25 text-emerald-400
+                  hover:bg-emerald-500/20 transition-all flex items-center gap-1"
+              >
+                <Download size={9} /> Backup
+              </button>
+
+              {/* Load backup */}
+              <button
+                onClick={() => fileInputRef.current?.click()}
+                className="text-[9px] font-black uppercase tracking-widest px-2 py-1 rounded-lg border
+                  bg-slate-800 border-slate-700 text-slate-400
+                  hover:text-white hover:border-slate-500 transition-all flex items-center gap-1"
+              >
+                <Upload size={9} /> Load
+              </button>
+              {/* Jump to today */}
+              <button onClick={jumpToToday}
+                className="text-[9px] font-black uppercase tracking-widest px-2 py-1 rounded-lg border bg-blue-500/10 border-blue-500/25 text-blue-400 hover:bg-blue-500/20 transition-all flex items-center gap-1">
+                <Calendar size={9} /> Today
+              </button>
+              {/* Shortcuts */}
+              <button onClick={() => setShowShortcuts(v => !v)}
+                className="text-[9px] font-black uppercase tracking-widest px-2 py-1 rounded-lg border bg-slate-800 border-slate-700 text-slate-500 hover:text-slate-300 transition-all flex items-center gap-1">
+                <Keyboard size={9} /> ?
+              </button>
+            </div>
+            <p className={`text-[11px] font-bold mt-0.5 truncate ${reality.color}`}>{reality.text}</p>
+          </div>
+
+          {/* Stat pills */}
+          <div className="flex flex-wrap gap-1.5 shrink-0">
+            <StatPill icon={<Flame size={11} className="text-orange-400 fill-orange-400/50" />} label="Streak" value={`${currentStreak}d`} bg="bg-orange-500/10 border-orange-500/25" color="text-orange-400" />
+            <StatPill icon={<Trophy size={11} className="text-yellow-400" />} label="Best" value={`${bestStreak}d`} bg="bg-yellow-500/10 border-yellow-500/25" color="text-yellow-400" />
+            <StatPill icon={<CheckCircle size={11} className="text-emerald-400" />} label="Wins" value={String(globalWins)} bg="bg-emerald-500/10 border-emerald-500/25" color="text-emerald-400" />
+            <StatPill icon={<ShieldAlert size={11} className="text-rose-400" />} label="Wasted" value={String(globalLosses)} bg="bg-rose-500/10 border-rose-500/25" color="text-rose-400" />
+            <StatPill icon={<TrendingUp size={11} className="text-blue-400" />} label="Rate" value={`${winRate}%`} bg="bg-blue-500/10 border-blue-500/25" color="text-blue-400" />
+            <StatPill icon={<Calendar size={11} className="text-slate-400" />} label="Left" value={`${daysLeft}d`} bg="bg-slate-700/30 border-slate-700/50" color="text-slate-300" />
+          </div>
+        </div>
+      </header>
+
+      {/* ── MOBILE TAB BAR ────────────────────────────────────────────────────── */}
+      <div className="xl:hidden shrink-0 border-b border-slate-800/80 bg-slate-950/95 z-30">
+        <div className="flex">
+          {(["calendar", "log"] as const).map(v => (
+            <button key={v} onClick={() => setMobileView(v)}
+              className={`flex-1 py-2.5 text-[10px] font-black uppercase tracking-widest transition-all border-b-2 ${mobileView === v ? "border-blue-500 text-blue-400" : "border-transparent text-slate-600 hover:text-slate-400"
+                }`}>
+              {v === "calendar" ? "📅 Calendar" : `📝 ${selectedMonth} ${selectedDay}`}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {/* ── MAIN RESIZABLE BODY ───────────────────────────────────────────────── */}
+      <div
+        ref={containerRef}
+        className={`flex-1 flex overflow-hidden ${isDragging ? "select-none cursor-col-resize" : ""}`}
+      >
+
+        {/* ── LEFT CALENDAR PANEL ─────────────────────────────────────────────── */}
+        <div
+          ref={calScrollRef}
+          className={`relative flex flex-col overflow-y-auto overflow-x-hidden ${mobileView === "log" ? "hidden xl:flex" : "flex"}`}
+          style={{ width: `${leftPct}%` }}
+        >
+          {/* Month quick-jump pills */}
+          <div className="sticky top-0 z-20 bg-slate-950/95 backdrop-blur-md border-b border-slate-800/50 px-4 py-2">
+            <div className="flex gap-1.5 overflow-x-auto scrollbar-none">
+              {MONTHS.map((m, i) => {
+                const s = getMonthStats(yearData, m);
+                const isNow = m === TODAY_MONTH;
+                const hasSel = selectedMonth === m;
+                return (
+                  <button
+                    key={m}
+                    onClick={() => {
+                      // scroll the month card into view
+                      const el = document.getElementById(`month-${m}`);
+                      el?.scrollIntoView({ behavior: "smooth", block: "start" });
+                    }}
+                    className={`shrink-0 flex items-center gap-1 px-2.5 py-1 rounded-lg text-[9px] font-black uppercase tracking-wider border transition-all ${isNow ? "bg-blue-500/20 border-blue-500/50 text-blue-400" :
+                        hasSel ? "bg-slate-700/50 border-slate-600 text-slate-300" :
+                          "bg-slate-900 border-slate-800 text-slate-600 hover:text-slate-400 hover:border-slate-700"
+                      }`}
+                  >
+                    {m.slice(0, 3)}
+                    {s.rate !== null && (
+                      <span className={`${s.rate >= 70 ? "text-emerald-400" : s.rate >= 50 ? "text-yellow-400" : "text-rose-400"}`}>
+                        {s.rate}%
+                      </span>
+                    )}
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+
+          {/* 12-month grid */}
+          <div className="p-4 grid grid-cols-1 sm:grid-cols-2 2xl:grid-cols-3 gap-4 content-start">
+            {MONTHS.map((month, mIdx) => {
+              const daysInMonth = getDaysInMonth(mIdx);
+              const offset = getFirstDayOffset(mIdx);
+              const isNowMonth = month === TODAY_MONTH;
+              const isFutureMonth = mIdx > TODAY_M_IDX;
+              const stats = getMonthStats(yearData, month);
+
+              return (
+                <div
+                  key={month}
+                  id={`month-${month}`}
+                  ref={isNowMonth ? todayRef : null}
+                  className={`bg-slate-900 rounded-2xl border p-4 transition-all scroll-mt-16 ${isNowMonth ? "border-blue-500/50 shadow-xl shadow-blue-500/5" : "border-slate-800 hover:border-slate-700"
+                    }`}
+                >
+                  {/* Month header */}
+                  <div className="flex items-center justify-between mb-2">
+                    <div className="flex items-center gap-2">
+                      <h3 className={`text-[11px] font-black uppercase tracking-widest ${isNowMonth ? "text-blue-400" : "text-slate-400"}`}>
+                        {month}
+                      </h3>
+                      {isNowMonth && <span className="text-[7px] bg-blue-500 text-white font-black px-1.5 py-0.5 rounded-full">NOW</span>}
+                      {isFutureMonth && <span className="text-[7px] text-slate-700 font-bold">future</span>}
+                    </div>
+                    <div className="flex items-center gap-1 text-[9px] font-black">
+                      {stats.wins > 0 && <span className="text-emerald-400">{stats.wins}W</span>}
+                      {stats.wins > 0 && stats.losses > 0 && <span className="text-slate-700">·</span>}
+                      {stats.losses > 0 && <span className="text-rose-400">{stats.losses}L</span>}
+                      {stats.rate !== null && (
+                        <span className={`ml-1 ${stats.rate >= 70 ? "text-emerald-400" : stats.rate >= 50 ? "text-yellow-400" : "text-rose-400"}`}>
+                          {stats.rate}%
+                        </span>
+                      )}
+                    </div>
+                  </div>
+
+                  {/* Progress bar */}
+                  {stats.wins + stats.losses > 0 && (
+                    <div className="mb-2 h-0.5 bg-slate-800 rounded-full overflow-hidden">
+                      <div className="h-full bg-emerald-500/60 rounded-full transition-all duration-500"
+                        style={{ width: `${stats.rate ?? 0}%` }} />
+                    </div>
+                  )}
+
+                  {/* Day-of-week labels */}
+                  <div className="grid grid-cols-7 gap-1 mb-1">
+                    {["M", "T", "W", "T", "F", "S", "S"].map((d, i) => (
+                      <div key={i} className="text-center text-[7px] text-slate-700 font-black">{d}</div>
+                    ))}
+                  </div>
+
+                  {/* Day cells */}
+                  <div className="grid grid-cols-7 gap-1">
+                    {Array.from({ length: offset }).map((_, i) => <div key={`b${i}`} />)}
+
+                    {Array.from({ length: daysInMonth }, (_, i) => i + 1).map((day) => {
+                      const dayObj = yearData[month]?.[day];
+                      const status = dayObj?.status;
+                      const isToday = isNowMonth && day === TODAY_DAY;
+                      const isSelected = selectedMonth === month && selectedDay === day;
+                      const isFuture = isFutureMonth || (isNowMonth && day > TODAY_DAY);
+                      const hasAudit = !!(dayObj?.learned || dayObj?.did || dayObj?.timeLeak);
+
+                      let cell = "bg-slate-800/50 border-slate-700/40 text-slate-600 hover:bg-slate-700/50 hover:text-slate-300 cursor-pointer";
+                      if (status === "succeed") cell = "bg-emerald-950/70 border-emerald-600/50 text-emerald-300 cursor-pointer hover:brightness-110";
+                      if (status === "wasted") cell = "bg-rose-950/70    border-rose-600/50    text-rose-300    cursor-pointer hover:brightness-110";
+                      if (isFuture && !status) cell = "bg-slate-900/20 border-slate-800/20 text-slate-800 cursor-default opacity-40";
+
+                      // Make today's cell slightly bigger / more prominent
+                      const todayCls = isToday
+                        ? "ring-2 ring-blue-500 ring-offset-1 ring-offset-slate-900 scale-110 z-10"
+                        : "";
+
+                      return (
+                        <div
+                          key={day}
+                          onClick={() => !isFuture && selectDay(month, day)}
+                          title={`${month} ${day}${status ? ` — ${status}` : ""}${hasAudit ? " ✎" : ""}`}
+                          className={`
+                            group relative aspect-square rounded-md border
+                            flex flex-col items-center justify-center
+                            text-[9px] font-black transition-all duration-150 select-none
+                            ${cell} ${todayCls}
+                            ${isSelected && !isToday ? "ring-1 ring-white/30 ring-offset-1 ring-offset-slate-900" : ""}
+                          `}
+                        >
+                          <span>{day}</span>
+
+                          {/* Audit dot */}
+                          {hasAudit && <span className="absolute bottom-[2px] w-[3px] h-[3px] rounded-full bg-blue-400" />}
+
+                          {/* Hover quick-mark overlay */}
+                          {!isFuture && (
+                            <div className="absolute inset-0 bg-slate-900/95 rounded-md flex items-center justify-center gap-0.5
+                              opacity-0 group-hover:opacity-100 transition-opacity z-20">
+                              <button
+                                onClick={e => { e.stopPropagation(); updateStatus(month, day, "succeed"); }}
+                                className="text-emerald-400 hover:scale-125 transition-transform p-0.5"
+                              ><CheckCircle size={10} /></button>
+                              <button
+                                onClick={e => { e.stopPropagation(); updateStatus(month, day, "wasted"); }}
+                                className="text-rose-400 hover:scale-125 transition-transform p-0.5"
+                              ><XCircle size={10} /></button>
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+
+          {/* ── Scroll-to-top FAB ──────────────────────────────────────────────── */}
+          {showScrollTop && (
+            <button
+              onClick={() => calScrollRef.current?.scrollTo({ top: 0, behavior: "smooth" })}
+              className="fixed bottom-6 left-6 z-50 w-9 h-9 flex items-center justify-center rounded-full
+                bg-slate-800 border border-slate-700 text-slate-400 hover:text-white
+                hover:border-slate-500 shadow-xl transition-all hover:scale-110"
+            >
+              <ChevronUp size={16} />
+            </button>
+          )}
+        </div>
+
+        {/* ── DRAG DIVIDER ─────────────────────────────────────────────────────── */}
+        <div
+          onMouseDown={onDividerMouseDown}
+          className={`hidden xl:flex shrink-0 w-1 relative items-center justify-center cursor-col-resize group z-30 ${isDragging ? "bg-blue-500/50" : "bg-slate-800 hover:bg-blue-500/40"
+            } transition-colors`}
+        >
+          <div className={`absolute flex flex-col gap-1 ${isDragging ? "opacity-100" : "opacity-0 group-hover:opacity-100"} transition-opacity`}>
+            <div className="w-1 h-6 rounded-full bg-blue-500/70" />
+          </div>
+          {/* Wider invisible hit area */}
+          <div className="absolute inset-y-0 -inset-x-2" />
+        </div>
+
+        {/* ── RIGHT AUDIT PANEL ────────────────────────────────────────────────── */}
+        <div
+          className={`flex-1 overflow-y-auto flex flex-col gap-4 p-4 ${mobileView === "calendar" ? "hidden xl:flex" : "flex"}`}
+        >
+
+          {/* ── Audit form ──────────────────────────────────────────────────────── */}
+          <div className="bg-slate-900 border border-slate-800 rounded-2xl p-5 shadow-2xl shrink-0">
+
+            {/* Header */}
+            <div className="flex items-start justify-between gap-3 mb-4">
+              <div>
+                <div className="flex items-center gap-2 flex-wrap">
+                  <span className="text-[9px] font-black text-blue-400 bg-blue-500/10 border border-blue-500/20 px-2.5 py-1 rounded-full uppercase tracking-widest">
+                    Audit Log
+                  </span>
+                  {isSelectedToday && (
+                    <span className="text-[9px] font-black text-orange-400 bg-orange-500/10 border border-orange-500/20 px-2 py-1 rounded-full uppercase tracking-widest">
+                      Today
+                    </span>
+                  )}
+                </div>
+                <h2 className="text-2xl font-black text-white mt-2 leading-none">
+                  {selectedMonth} {selectedDay}
+                </h2>
+                {/* Day nav arrows */}
+                <div className="flex items-center gap-1 mt-1.5">
+                  <button
+                    onClick={() => {
+                      const d = new Date(YEAR, MONTHS.indexOf(selectedMonth), selectedDay - 1);
+                      if (d.getFullYear() === YEAR) selectDay(MONTHS[d.getMonth()], d.getDate());
+                    }}
+                    className="p-1 rounded-lg bg-slate-800 border border-slate-700 text-slate-500 hover:text-white hover:border-slate-600 transition-all"
+                  ><ChevronsLeft size={10} /></button>
+                  <button
+                    onClick={jumpToToday}
+                    className="px-2 py-0.5 rounded-lg bg-slate-800 border border-slate-700 text-[8px] font-black text-slate-500 hover:text-white hover:border-slate-600 transition-all uppercase tracking-wider"
+                  >Today</button>
+                  <button
+                    onClick={() => {
+                      const d = new Date(YEAR, MONTHS.indexOf(selectedMonth), selectedDay + 1);
+                      if (d.getFullYear() === YEAR && d <= TODAY) selectDay(MONTHS[d.getMonth()], d.getDate());
+                    }}
+                    className="p-1 rounded-lg bg-slate-800 border border-slate-700 text-slate-500 hover:text-white hover:border-slate-600 transition-all"
+                  ><ChevronsRight size={10} /></button>
+                  {/* ── Reset current day only ──────────────────────────────────────────── */}
+                  {selectedDayData && (
+                    <button
+                      onClick={resetCurrentDay}
+                      title={confirmReset ? "Click again to confirm clear" : `Clear ${selectedMonth} ${selectedDay}`}
+                      className={`ml-auto flex items-center gap-1 px-2 py-0.5 rounded-lg border text-[8px] font-black uppercase tracking-wider transition-all ${confirmReset
+                          ? "bg-rose-600 border-rose-500 text-white animate-pulse"
+                          : "bg-slate-800 border-slate-700 text-slate-600 hover:text-rose-400 hover:border-rose-500/40"
+                        }`}
+                    >
+                      <RotateCcw size={8} />
+                      {confirmReset ? "Sure?" : "Clear Day"}
+                    </button>
+                  )}
+                </div>
+              </div>
+
+              {/* Status buttons */}
+              <div className="flex flex-col gap-1.5 shrink-0">
+                <button
+                  onClick={() => updateStatus(selectedMonth, selectedDay, "succeed")}
+                  className={`flex items-center gap-1.5 px-3 py-2 rounded-xl text-[10px] font-black border transition-all ${selectedDayData?.status === "succeed"
+                      ? "bg-emerald-500 border-emerald-400 text-white shadow-lg shadow-emerald-500/20"
+                      : "bg-emerald-500/10 border-emerald-500/25 text-emerald-400 hover:bg-emerald-500/20"
+                    }`}
+                >
+                  <CheckCircle size={10} /> Win <kbd className="text-[7px] opacity-50 ml-1">W</kbd>
+                </button>
+                <button
+                  onClick={() => updateStatus(selectedMonth, selectedDay, "wasted")}
+                  className={`flex items-center gap-1.5 px-3 py-2 rounded-xl text-[10px] font-black border transition-all ${selectedDayData?.status === "wasted"
+                      ? "bg-rose-500 border-rose-400 text-white shadow-lg shadow-rose-500/20"
+                      : "bg-rose-500/10 border-rose-500/25 text-rose-400 hover:bg-rose-500/20"
+                    }`}
+                >
+                  <XCircle size={10} /> Wasted <kbd className="text-[7px] opacity-50 ml-1">L</kbd>
+                </button>
+              </div>
+            </div>
+
+            {/* Status banner */}
+            {selectedDayData?.status && (
+              <div className={`text-center py-2 rounded-xl text-[10px] font-black uppercase tracking-widest border mb-4 ${selectedDayData.status === "succeed"
+                  ? "bg-emerald-950/50 border-emerald-600/30 text-emerald-400"
+                  : "bg-rose-950/50 border-rose-600/30 text-rose-400"
+                }`}>
+                {selectedDayData.status === "succeed" ? "✓ WIN — keep the chain alive" : "✗ WASTED — log it, learn, bounce back"}
+              </div>
+            )}
+
+            {/* Three audit fields */}
+            <div className="space-y-3">
+              <AuditField
+                icon={<BookOpen size={10} />} label="What did I actually learn?" labelColor="text-emerald-400"
+                borderFocus="focus:border-emerald-500/50" value={learnedInput} onChange={setLearnedInput}
+                placeholder="Concept, pattern, algorithm. Not 'studied graphs' — write the actual insight."
+              />
+              <AuditField
+                icon={<Code2 size={10} />} label="What did I actually do?" labelColor="text-blue-400"
+                borderFocus="focus:border-blue-500/50" value={didInput} onChange={setDidInput}
+                placeholder="LC problem #, CF problem, rating change, submissions. Zero is valid — write it."
+              />
+              <AuditField
+                icon={<Clock size={10} />} label="Where did my 24 hours go?" labelColor="text-rose-400"
+                borderFocus="focus:border-rose-500/50" value={leakInput} onChange={setLeakInput}
+                placeholder="YouTube? Daydreaming? Roadmap tabs? Another tracker? Name the exact leak."
+              />
+            </div>
+
+            {/* Save */}
+            <button
+              onClick={saveAudit}
+              className={`mt-4 w-full font-black py-3 rounded-xl text-xs transition-all uppercase tracking-widest ${saveState === "saved"
+                  ? "bg-emerald-600 text-white cursor-default"
+                  : "bg-blue-600 hover:bg-blue-500 text-white active:scale-95"
+                }`}
+            >
+              {saveState === "saved" ? "✓ Committed" : "Commit to Disk →"}
+              {saveState === "idle" && <kbd className="ml-2 text-[8px] opacity-50">Ctrl+S</kbd>}
+            </button>
+          </div>
+
+          {/* ── Saved preview ───────────────────────────────────────────────────── */}
+          {(selectedDayData?.learned || selectedDayData?.did || selectedDayData?.timeLeak) && (
+            <div className="bg-slate-900/50 border border-slate-800 rounded-2xl p-4 space-y-3 shrink-0">
+              <p className="text-[9px] font-black text-slate-700 uppercase tracking-widest">
+                Saved Entry — {selectedMonth} {selectedDay}
+              </p>
+              {selectedDayData.learned && <LogEntry icon={<BookOpen size={9} />} color="text-emerald-400" label="Learned" text={selectedDayData.learned} />}
+              {selectedDayData.did && <LogEntry icon={<Code2 size={9} />} color="text-blue-400" label="Did" text={selectedDayData.did} />}
+              {selectedDayData.timeLeak && <LogEntry icon={<Clock size={9} />} color="text-rose-400" label="Time Leak" text={selectedDayData.timeLeak} />}
+            </div>
+          )}
+
+          {/* ── Brain Override ──────────────────────────────────────────────────── */}
+          <div className="bg-slate-900 border border-orange-500/20 rounded-2xl p-4 shrink-0">
+            <div className="flex items-center gap-2 mb-3">
+              <Zap size={12} className="text-orange-400" />
+              <h4 className="text-[9px] font-black text-orange-400 uppercase tracking-widest">Brain Override Protocol</h4>
+            </div>
+            <ul className="space-y-2 text-[10px] text-slate-500 leading-relaxed">
+              <li><span className="text-orange-400 font-bold">→</span> Open LeetCode. Click <span className="text-white">one</span> problem. Just read it. That&apos;s your only task.</li>
+              <li><span className="text-orange-400 font-bold">→</span> 25-min timer. Not for solving — just to <span className="text-white font-bold">sit still with it.</span></li>
+              <li><span className="text-orange-400 font-bold">→</span> The urge to switch tabs IS the resistance. Staying is the rep.</li>
+              <li><span className="text-orange-400 font-bold">→</span> Roadmaps = procrastination dressed up. Problem #1 is the roadmap.</li>
+              <li><span className="text-orange-400 font-bold">→</span> Daydreaming about being rich ≠ the work. This app ≠ the work. LC = the work.</li>
+              <li className="text-orange-300 font-black pt-1 border-t border-orange-500/20">→ Close this. Open LeetCode. Right now.</li>
+            </ul>
+          </div>
+
+          {/* ── Legend ──────────────────────────────────────────────────────────── */}
+          <div className="bg-slate-900 border border-slate-800 rounded-2xl p-4 shrink-0">
+            <p className="text-[9px] font-black text-slate-700 uppercase tracking-widest mb-3">Legend</p>
+            <div className="space-y-2">
+              <LegendItem color="bg-emerald-950/70 border-emerald-600/50" label="Grinded — problem attempted or concept learned" />
+              <LegendItem color="bg-rose-950/70 border-rose-600/50" label="Wasted — brain won, you didn&apos;t grind" />
+              <LegendItem color="bg-slate-800/50 border-slate-700/40" label="Unmarked — log before bed. No blank days." />
+              <div className="flex items-center gap-2.5">
+                <div className="w-5 h-5 rounded-md border-2 border-blue-500 bg-slate-900 shrink-0" />
+                <span className="text-[10px] text-slate-500">Blue ring + scale = today</span>
+              </div>
+              <div className="flex items-center gap-2.5">
+                <div className="w-5 h-5 rounded-md bg-slate-800/50 border border-slate-700/40 relative shrink-0">
+                  <span className="absolute bottom-[2px] left-1/2 -translate-x-1/2 w-[3px] h-[3px] rounded-full bg-blue-400" />
+                </div>
+                <span className="text-[10px] text-slate-500">Blue dot = audit written</span>
+              </div>
+            </div>
+          </div>
+
+        </div>{/* end right panel */}
+      </div>{/* end body */}
+    </div>
+  );
+}
+
+// ─── Sub-components ───────────────────────────────────────────────────────────
+
+function StatPill({ icon, label, value, bg, color }: {
+  icon: React.ReactNode; label: string; value: string; bg: string; color: string;
+}) {
+  return (
+    <div className={`flex items-center gap-1.5 border px-2.5 py-1.5 rounded-xl ${bg}`}>
+      {icon}
+      <div>
+        <p className="text-[7px] text-slate-700 uppercase leading-none font-black">{label}</p>
+        <p className={`text-xs font-black leading-tight ${color}`}>{value}</p>
+      </div>
+    </div>
+  );
+}
+
+function AuditField({ icon, label, labelColor, borderFocus, value, onChange, placeholder }: {
+  icon: React.ReactNode; label: string; labelColor: string; borderFocus: string;
+  value: string; onChange: (v: string) => void; placeholder: string;
+}) {
+  return (
+    <div>
+      <label className={`flex items-center gap-1.5 text-[9px] font-black uppercase tracking-widest mb-1.5 ${labelColor}`}>
+        {icon} {label}
+      </label>
+      <textarea
+        value={value} onChange={e => onChange(e.target.value)} placeholder={placeholder} rows={3}
+        className={`w-full bg-slate-950 border border-slate-800 ${borderFocus} rounded-xl p-3 text-[11px]
+          text-slate-300 focus:outline-none resize-none placeholder:text-slate-700 transition-colors leading-relaxed`}
+      />
+    </div>
+  );
+}
+
+function LogEntry({ icon, color, label, text }: {
+  icon: React.ReactNode; color: string; label: string; text: string;
+}) {
+  return (
+    <div>
+      <p className={`flex items-center gap-1 text-[9px] font-black uppercase tracking-widest mb-1 ${color}`}>
+        {icon} {label}
+      </p>
+      <p className="text-[11px] text-slate-400 leading-relaxed whitespace-pre-wrap break-words">{text}</p>
+    </div>
+  );
+}
+
+function LegendItem({ color, label }: { color: string; label: string }) {
+  return (
+    <div className="flex items-center gap-2.5">
+      <div className={`w-5 h-5 rounded-md border shrink-0 ${color}`} />
+      <span className="text-[10px] text-slate-500">{label}</span>
     </div>
   );
 }

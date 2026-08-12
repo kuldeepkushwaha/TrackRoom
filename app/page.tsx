@@ -104,6 +104,12 @@ export default function Home() {
   const [showSyncPanel, setShowSyncPanel] = useState(false);
   const [isSyncEnabled, setIsSyncEnabled] = useState(false);
 
+  // Sync health
+const [isSyncBlocked,   setIsSyncBlocked]   = useState(false);
+const [syncBlockReason, setSyncBlockReason] = useState("");
+const [isInitialSync,   setIsInitialSync]   = useState(false); // blocks all writes during boot pull
+const [isLocalOnly,     setIsLocalOnly]     = useState(false); // true when cloud is unreachable
+
   const [appPasscode, setAppPasscode] = useState("");
   const [appPasscodeInput, setAppPasscodeInput] = useState("");
   const [passcodeVerified, setPasscodeVerified] = useState(false);
@@ -118,37 +124,123 @@ export default function Home() {
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   // ── Bootstrap ──────────────────────────────────────────────────────────────
-  useEffect(() => {
+useEffect(() => {
+  const boot = async () => {
+    let localData: YearData = {};
+
+    // ── Step 1: load local ─────────────────────────────────────────────
     try {
       const raw = localStorage.getItem(STORAGE_KEY);
-      const parsed: YearData = raw ? JSON.parse(raw) : {};
-      setYearData(parsed);
-      const d = parsed[TODAY_MONTH]?.[TODAY_DAY];
-      setLearnedInput(d?.learned || "");
-      setDidInput(d?.did || "");
-      setLeakInput(d?.timeLeak || "");
-
-      // Restore saved sync key and auto-pull if one exists
-      const savedKey = localStorage.getItem("dsa-sync-key");
-      if (savedKey) {
-        setSyncKey(savedKey);
-        setSyncKeyInput(savedKey);
-        setIsSyncEnabled(true);
-        // Auto-pull from cloud on load
-        pullFromCloud(savedKey, parsed);
-      }
-      const savedPasscode = localStorage.getItem("dsa-app-passcode");
-      if (savedPasscode) {
-        setAppPasscode(savedPasscode);
-        setAppPasscodeInput(savedPasscode);
-        setPasscodeVerified(true);
-      }
-
+      localData = raw ? JSON.parse(raw) : {};
     } catch {
       localStorage.removeItem(STORAGE_KEY);
     }
+
+    // ── Step 2: check saved credentials ────────────────────────────────
+    const savedKey      = localStorage.getItem("dsa-sync-key");
+    const savedPasscode = localStorage.getItem("dsa-app-passcode");
+
+    if (savedKey && savedPasscode) {
+      setSyncKey(savedKey);
+      setSyncKeyInput(savedKey);
+      setAppPasscode(savedPasscode);
+      setAppPasscodeInput(savedPasscode);
+      setPasscodeVerified(true);
+      setIsSyncEnabled(true);
+      setIsInitialSync(true); // 🔒 block all auto-pushes during boot
+
+      // ── Step 3: pull cloud FIRST — before setting any state ──────────
+      try {
+        setSyncStatus("syncing");
+        const res = await fetch(
+          `/api/sync?key=${encodeURIComponent(savedKey)}`,
+          { headers: { "x-app-passcode": savedPasscode } }
+        );
+        const json = await res.json().catch(() => ({}));
+
+        if (res.ok && json.data) {
+          // Cloud data exists — merge: cloud wins on conflict
+          const cloudData: YearData =
+            typeof json.data === "string"
+              ? JSON.parse(json.data)
+              : json.data;
+
+          const merged: YearData = { ...localData };
+          MONTHS.forEach((m) => {
+            if (!cloudData[m]) return;
+            merged[m] = { ...(merged[m] || {}), ...cloudData[m] };
+          });
+
+          // Persist merged locally but DO NOT push (skipPush=true)
+          setYearData(merged);
+          localStorage.setItem(STORAGE_KEY, JSON.stringify(merged));
+          localData = merged; // use merged for field init below
+
+          const totalDays = Object.values(cloudData).reduce(
+            (sum, m) => sum + Object.keys(m).length, 0
+          );
+          addToast(`Boot sync: ${totalDays} day(s) loaded from cloud ✓`, "success");
+          setSyncStatus("synced");
+          setIsLocalOnly(false);
+        } else if (res.ok && !json.data) {
+          // Key exists on server but no data yet — push local up
+          if (Object.keys(localData).length > 0) {
+            await fetch("/api/sync", {
+              method:  "POST",
+              headers: {
+                "Content-Type":   "application/json",
+                "x-app-passcode": savedPasscode,
+              },
+              body: JSON.stringify({ syncKey: savedKey, yearData: localData }),
+            });
+            addToast("Boot sync: local data pushed to cloud ✓", "success");
+          } else {
+            addToast("Sync ready. Start marking days!", "info");
+          }
+          setSyncStatus("synced");
+          setIsLocalOnly(false);
+        } else if (res.status === 401) {
+          setPasscodeVerified(false);
+          setIsSyncEnabled(false);
+          setSyncStatus("error");
+          setIsLocalOnly(true);
+          addToast("Saved passcode rejected — re-enter in Sync panel.", "error");
+        } else if (res.status === 403) {
+          setIsSyncBlocked(true);
+          setSyncBlockReason(json?.error || "Max sync keys reached.");
+          setIsLocalOnly(true);
+          setSyncStatus("error");
+          addToast(`Sync blocked: ${json?.error}`, "error");
+        } else {
+          // Network or server error — go offline
+          setIsLocalOnly(true);
+          setSyncStatus("idle");
+          addToast("Cloud unreachable — working offline. Data safe locally.", "info");
+        }
+      } catch {
+        setIsLocalOnly(true);
+        setSyncStatus("idle");
+        addToast("No network — working offline. Data safe locally.", "info");
+      } finally {
+        setIsInitialSync(false); // 🔓 unlock writes
+        setTimeout(() => setSyncStatus("idle"), 3000);
+      }
+    } else {
+      // No saved sync — just use local
+      setYearData(localData);
+    }
+
+    // ── Step 4: init audit fields for today ──────────────────────────────
+    const d = localData[TODAY_MONTH]?.[TODAY_DAY];
+    setLearnedInput(d?.learned  || "");
+    setDidInput    (d?.did      || "");
+    setLeakInput   (d?.timeLeak || "");
+
     setMounted(true);
-  }, []);
+  };
+
+  boot();
+}, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   // ── Auto-scroll to today's month ───────────────────────────────────────────
   useEffect(() => {
@@ -207,6 +299,12 @@ const pushToCloud = async (data: YearData, key?: string) => {
   const k  = (key || syncKey).trim();
   if (!k || k.length < 4) return;
 
+  // Hard block — don't even try if we know it's blocked
+  if (isSyncBlocked) {
+    setIsLocalOnly(true);
+    return;
+  }
+
   const pc = localStorage.getItem("dsa-app-passcode") || appPasscode;
   if (!pc) {
     addToast("Enter app passcode first via Sync panel.", "error");
@@ -215,7 +313,7 @@ const pushToCloud = async (data: YearData, key?: string) => {
 
   setSyncStatus("syncing");
   try {
-    const res = await fetch("/api/sync", {
+    const res  = await fetch("/api/sync", {
       method:  "POST",
       headers: {
         "Content-Type":   "application/json",
@@ -228,54 +326,63 @@ const pushToCloud = async (data: YearData, key?: string) => {
 
     if (res.status === 401) {
       setPasscodeVerified(false);
-      addToast("Wrong app passcode — re-enter in Sync panel.", "error");
+      setIsLocalOnly(true);
+      addToast("Wrong passcode — data saved locally only.", "error");
       setSyncStatus("error");
       setTimeout(() => setSyncStatus("idle"), 4000);
       return;
     }
-    if (res.status === 400) {
-      addToast(`Bad key: ${json?.error || "invalid sync key format"}`, "error");
-      setSyncStatus("error");
-      setTimeout(() => setSyncStatus("idle"), 4000);
-      return;
-    }
+
     if (res.status === 403) {
-      addToast("Max sync keys reached. Contact admin.", "error");
+      // ── Max keys hit — hard block forever until key changes ───────────
+      setIsSyncBlocked(true);
+      setIsLocalOnly(true);
       setSyncStatus("error");
-      setTimeout(() => setSyncStatus("idle"), 4000);
+      const reason = json?.error || "Max sync keys reached.";
+      setSyncBlockReason(reason);
+      addToast(`🔒 Sync blocked — ${reason} Data is LOCAL ONLY.`, "error");
+      setTimeout(() => setSyncStatus("idle"), 5000);
       return;
     }
+
     if (res.status === 429) {
       addToast("Too many requests — wait a minute.", "error");
       setSyncStatus("error");
       setTimeout(() => setSyncStatus("idle"), 4000);
       return;
     }
+
     if (!res.ok) {
-      addToast(`Push failed ${res.status}: ${json?.error || "unknown"}`, "error");
+      setIsLocalOnly(true);
+      addToast(`Push failed (${res.status}): ${json?.error || "unknown"}`, "error");
       setSyncStatus("error");
       setTimeout(() => setSyncStatus("idle"), 4000);
       return;
     }
 
+    // Success
+    setIsLocalOnly(false);
     setSyncStatus("synced");
     setTimeout(() => setSyncStatus("idle"), 3000);
   } catch {
+    setIsLocalOnly(true);
     setSyncStatus("error");
-    addToast("Cloud sync failed — saved locally.", "error");
+    addToast("Network error — data saved locally.", "error");
     setTimeout(() => setSyncStatus("idle"), 4000);
   }
 };
   // ── Persistence ────────────────────────────────────────────────────────────
-  const persist = useCallback((next: YearData, skipPush = false) => {
-    setYearData(next);
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(next));
-    // Auto-push to cloud if sync is enabled
-    if (!skipPush) {
-      const k = localStorage.getItem("dsa-sync-key");
-      if (k) pushToCloud(next, k);
-    }
-  }, []);
+const persist = useCallback((next: YearData, skipPush = false) => {
+  setYearData(next);
+  localStorage.setItem(STORAGE_KEY, JSON.stringify(next));
+
+  // Never auto-push during boot pull or when sync is blocked
+  if (!skipPush && !isInitialSync && !isSyncBlocked) {
+    const k  = localStorage.getItem("dsa-sync-key");
+    const pc = localStorage.getItem("dsa-app-passcode");
+    if (k && pc) pushToCloud(next, k);
+  }
+}, [isInitialSync, isSyncBlocked]); // eslint-disable-line react-hooks/exhaustive-deps
   const updateStatus = useCallback((month: string, day: number, status: "succeed" | "wasted") => {
     setYearData(prev => {
       const existing = prev[month]?.[day] ?? { learned: "", did: "", timeLeak: "" };
@@ -450,6 +557,11 @@ const pullFromCloud = async (key?: string, localData?: YearData) => {
   const k  = (key || syncKey).trim();
   if (!k || k.length < 4) return;
 
+  if (isSyncBlocked) {
+    addToast("Sync is blocked — change your sync key.", "error");
+    return;
+  }
+
   const pc = localStorage.getItem("dsa-app-passcode") || appPasscode;
   if (!pc) {
     addToast("Enter app passcode first via Sync panel.", "error");
@@ -458,36 +570,49 @@ const pullFromCloud = async (key?: string, localData?: YearData) => {
 
   setSyncStatus("syncing");
   try {
-    const res = await fetch(
+    const res  = await fetch(
       `/api/sync?key=${encodeURIComponent(k)}`,
       { headers: { "x-app-passcode": pc } }
     );
 
-    // Always try to parse the body for error details
     const json = await res.json().catch(() => ({}));
 
     if (res.status === 401) {
       setPasscodeVerified(false);
-      addToast("Wrong app passcode — re-enter in Sync panel.", "error");
+      setIsLocalOnly(true);
+      addToast("Wrong passcode — re-enter in Sync panel.", "error");
       setSyncStatus("error");
       setTimeout(() => setSyncStatus("idle"), 4000);
       return;
     }
+
+    if (res.status === 403) {
+      setIsSyncBlocked(true);
+      setIsLocalOnly(true);
+      setSyncBlockReason(json?.error || "Max sync keys reached.");
+      addToast(`🔒 Sync blocked — ${json?.error}`, "error");
+      setSyncStatus("error");
+      setTimeout(() => setSyncStatus("idle"), 5000);
+      return;
+    }
+
     if (res.status === 400) {
-      // Show the actual server error message so user knows what's wrong
-      addToast(`Bad key: ${json?.error || "invalid sync key format"}`, "error");
+      addToast(`Bad sync key: ${json?.error}`, "error");
       setSyncStatus("error");
       setTimeout(() => setSyncStatus("idle"), 4000);
       return;
     }
+
     if (res.status === 429) {
       addToast("Too many requests — wait a minute.", "error");
       setSyncStatus("error");
       setTimeout(() => setSyncStatus("idle"), 4000);
       return;
     }
+
     if (!res.ok) {
-      addToast(`Server error ${res.status}: ${json?.error || "unknown"}`, "error");
+      setIsLocalOnly(true);
+      addToast(`Server error (${res.status}): ${json?.error}`, "error");
       setSyncStatus("error");
       setTimeout(() => setSyncStatus("idle"), 4000);
       return;
@@ -496,43 +621,53 @@ const pullFromCloud = async (key?: string, localData?: YearData) => {
     const { data } = json;
 
     if (!data) {
-      // Nothing in cloud yet — push local up
+      // Nothing in cloud — push local up only if we have local data
       const existing = localData || yearData;
       if (Object.keys(existing).length > 0) {
         await pushToCloud(existing, k);
         addToast("First sync — local data pushed to cloud ✓", "success");
       } else {
-        addToast("Sync key ready. Start marking days!", "info");
+        addToast("Sync key ready. No data yet — start marking days!", "info");
       }
+      setIsLocalOnly(false);
       setSyncStatus("synced");
       setTimeout(() => setSyncStatus("idle"), 3000);
       return;
     }
 
-    // Merge cloud → local
+    // ── Merge: cloud wins on any conflicting day ───────────────────────
     const cloudData: YearData =
       typeof data === "string" ? JSON.parse(data) : data;
-    const merged: YearData = { ...(localData || yearData) };
 
+    // Start from local, overwrite with cloud
+    const merged: YearData = { ...(localData || yearData) };
     MONTHS.forEach((m) => {
       if (!cloudData[m]) return;
+      // Cloud days override local days
       merged[m] = { ...(merged[m] || {}), ...cloudData[m] };
     });
 
-    persist(merged);
+    // Save merged locally — skip push (we just pulled, no need to push back)
+    setYearData(merged);
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(merged));
 
+    // Refresh audit panel
     const d = merged[selectedMonth]?.[selectedDay];
     setLearnedInput(d?.learned  || "");
     setDidInput    (d?.did      || "");
     setLeakInput   (d?.timeLeak || "");
 
+    setIsLocalOnly(false);
+    setIsSyncBlocked(false);
+
     const totalDays = Object.values(cloudData).reduce(
       (sum, m) => sum + Object.keys(m).length, 0
     );
-    addToast(`Synced ${totalDays} day(s) from cloud ✓`, "success");
+    addToast(`Pulled ${totalDays} day(s) from cloud ✓`, "success");
     setSyncStatus("synced");
     setTimeout(() => setSyncStatus("idle"), 3000);
   } catch {
+    setIsLocalOnly(true);
     setSyncStatus("error");
     addToast("Network error — working offline.", "error");
     setTimeout(() => setSyncStatus("idle"), 4000);
@@ -617,14 +752,17 @@ const activateSyncKey = async () => {
 };
 
   // ── Disconnect sync ────────────────────────────────────────────────────────
-  const disconnectSync = () => {
-    setSyncKey("");
-    setSyncKeyInput("");
-    setIsSyncEnabled(false);
-    setSyncStatus("idle");
-    localStorage.removeItem("dsa-sync-key");
-    addToast("Cloud sync disconnected. Data still saved locally.", "info");
-  };
+const disconnectSync = () => {
+  setSyncKey("");
+  setSyncKeyInput("");
+  setIsSyncEnabled(false);
+  setIsSyncBlocked(false);
+  setSyncBlockReason("");
+  setIsLocalOnly(false);
+  setSyncStatus("idle");
+  localStorage.removeItem("dsa-sync-key");
+  addToast("Cloud sync disconnected. Data still saved locally.", "info");
+};
 
   // ── Keyboard shortcuts ─────────────────────────────────────────────────────
   useEffect(() => {
@@ -660,13 +798,22 @@ const activateSyncKey = async () => {
   }, [mounted, selectedMonth, selectedDay, updateStatus, saveAudit, selectDay]);
 
   if (!mounted) return (
-    <div className="min-h-screen bg-slate-950 flex items-center justify-center">
-      <div className="flex flex-col items-center gap-3">
-        <div className="w-8 h-8 border-2 border-blue-500 border-t-transparent rounded-full animate-spin" />
-        <p className="text-slate-500 text-xs font-black uppercase tracking-widest">Loading War Room...</p>
+  <div className="min-h-screen bg-slate-950 flex items-center justify-center">
+    <div className="flex flex-col items-center gap-4">
+      <div className="w-8 h-8 border-2 border-blue-500 border-t-transparent rounded-full animate-spin" />
+      <div className="text-center space-y-1">
+        <p className="text-slate-300 text-xs font-black uppercase tracking-widest">
+          Loading War Room...
+        </p>
+        <p className="text-slate-600 text-[10px]">
+          {localStorage.getItem("dsa-sync-key")
+            ? "Pulling latest data from cloud..."
+            : "Loading local data..."}
+        </p>
       </div>
     </div>
-  );
+  </div>
+);
 
   // ── Computed stats ─────────────────────────────────────────────────────────
   let globalWins = 0, globalLosses = 0;
@@ -1055,6 +1202,42 @@ const activateSyncKey = async () => {
           </div>
         </div>
       </header>
+      {/* ── LOCAL ONLY WARNING BANNER ──────────────────────────────────────── */}
+{(isLocalOnly || isSyncBlocked) && mounted && (
+  <div className={`shrink-0 px-4 py-2 flex items-center justify-between gap-3 text-xs font-black ${
+    isSyncBlocked
+      ? "bg-rose-950/80 border-b border-rose-600/40 text-rose-300"
+      : "bg-orange-950/80 border-b border-orange-600/40 text-orange-300"
+  }`}>
+    <div className="flex items-center gap-2">
+      <CloudOff size={13} className="shrink-0" />
+      <span>
+        {isSyncBlocked
+          ? `🔒 SYNC BLOCKED — ${syncBlockReason} Your data is saved locally only.`
+          : "⚠ OFFLINE MODE — Changes saved locally. Cloud unreachable."}
+      </span>
+    </div>
+    {isSyncBlocked ? (
+      <button
+        onClick={() => setShowSyncPanel(true)}
+        className="shrink-0 px-2 py-1 rounded-lg bg-rose-600/30
+          border border-rose-500/40 hover:bg-rose-600/50
+          transition-all text-[9px] uppercase tracking-wider"
+      >
+        Change Key
+      </button>
+    ) : (
+      <button
+        onClick={() => pullFromCloud()}
+        className="shrink-0 px-2 py-1 rounded-lg bg-orange-600/30
+          border border-orange-500/40 hover:bg-orange-600/50
+          transition-all text-[9px] uppercase tracking-wider"
+      >
+        Retry Sync
+      </button>
+    )}
+  </div>
+)}
 
       {/* ── MOBILE TAB BAR ────────────────────────────────────────────────────── */}
       <div className="xl:hidden shrink-0 border-b border-slate-800/80 bg-slate-950/95 z-30">

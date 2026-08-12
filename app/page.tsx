@@ -199,17 +199,35 @@ const pushToCloud = async (data: YearData, key?: string) => {
   try {
     const res = await fetch("/api/sync", {
       method:  "POST",
-      headers: { "Content-Type": "application/json" },
-      body:    JSON.stringify({ syncKey: k, yearData: data }),
+      headers: {
+        "Content-Type":   "application/json",
+        "x-app-passcode": process.env.NEXT_PUBLIC_APP_PASSCODE || "",
+      },
+      body: JSON.stringify({ syncKey: k, yearData: data }),
     });
 
+    if (res.status === 401) {
+      addToast("Wrong app passcode — check your setup.", "error");
+      setSyncStatus("error");
+      return;
+    }
+    if (res.status === 403) {
+      addToast("Max sync keys reached. Contact your admin.", "error");
+      setSyncStatus("error");
+      return;
+    }
+    if (res.status === 429) {
+      addToast("Too many requests — slow down.", "error");
+      setSyncStatus("error");
+      return;
+    }
     if (!res.ok) throw new Error("Push failed");
 
     setSyncStatus("synced");
     setTimeout(() => setSyncStatus("idle"), 3000);
   } catch {
     setSyncStatus("error");
-    addToast("Cloud sync failed — data still saved locally.", "error");
+    addToast("Cloud sync failed — data saved locally.", "error");
     setTimeout(() => setSyncStatus("idle"), 4000);
   }
 };
@@ -399,13 +417,27 @@ const pullFromCloud = async (key?: string, localData?: YearData) => {
 
   setSyncStatus("syncing");
   try {
-    const res = await fetch(`/api/sync?key=${encodeURIComponent(k)}`);
+    const res = await fetch(
+      `/api/sync?key=${encodeURIComponent(k)}&passcode=${encodeURIComponent(
+        process.env.NEXT_PUBLIC_APP_PASSCODE || ""
+      )}`
+    );
+
+    if (res.status === 401) {
+      addToast("Wrong app passcode — check your setup.", "error");
+      setSyncStatus("error");
+      return;
+    }
+    if (res.status === 429) {
+      addToast("Too many requests — slow down.", "error");
+      setSyncStatus("error");
+      return;
+    }
     if (!res.ok) throw new Error("Pull failed");
 
     const { data } = await res.json();
 
     if (!data) {
-      // Nothing in cloud yet — push local data up
       const existing = localData || yearData;
       if (Object.keys(existing).length > 0) {
         await pushToCloud(existing, k);
@@ -418,9 +450,9 @@ const pullFromCloud = async (key?: string, localData?: YearData) => {
       return;
     }
 
-    // Merge: cloud wins on conflict
-    const cloudData: YearData = typeof data === "string" ? JSON.parse(data) : data;
-    const base = localData || yearData;
+    const cloudData: YearData =
+      typeof data === "string" ? JSON.parse(data) : data;
+    const base   = localData || yearData;
     const merged: YearData = { ...base };
 
     MONTHS.forEach((m) => {
@@ -435,9 +467,10 @@ const pullFromCloud = async (key?: string, localData?: YearData) => {
     setDidInput    (d?.did      || "");
     setLeakInput   (d?.timeLeak || "");
 
-    const totalDays = Object.values(cloudData)
-      .reduce((sum, m) => sum + Object.keys(m).length, 0);
-
+    const totalDays = Object.values(cloudData).reduce(
+      (sum, m) => sum + Object.keys(m).length,
+      0
+    );
     addToast(`Synced ${totalDays} day(s) from cloud ✓`, "success");
     setSyncStatus("synced");
     setTimeout(() => setSyncStatus("idle"), 3000);

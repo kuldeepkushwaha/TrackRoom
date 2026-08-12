@@ -91,6 +91,8 @@ function mergeDayData(
 }
 
 // Deep field-level merge of two YearData objects
+// Server stores tombstones — NEVER resolves them
+// Clients use stripTombstones() for display only
 function mergeYearData(base: YearData, incoming: YearData): YearData {
   const result: YearData = { ...base };
 
@@ -99,23 +101,25 @@ function mergeYearData(base: YearData, incoming: YearData): YearData {
     const mergedMonth: MonthData = { ...(result[m] || {}) };
 
     Object.keys(incoming[m]).forEach((dayStr) => {
-      const day    = Number(dayStr);
-      const merged = mergeDayData(mergedMonth[day], incoming[m][day]);
+      const day      = Number(dayStr);
+      const localDay = mergedMonth[day];
+      const cloudDay = incoming[m][day];
 
-      if (merged === undefined) {
-        // Tombstone won — remove the day entirely
-        delete mergedMonth[day];
-      } else {
-        mergedMonth[day] = merged;
-      }
+      if (!localDay && !cloudDay) return;
+      if (!localDay) { mergedMonth[day] = cloudDay; return; }
+      if (!cloudDay) { mergedMonth[day] = localDay; return; }
+
+      const localTs = localDay.updatedAt || 0;
+      const cloudTs = cloudDay.updatedAt || 0;
+
+      // Newer timestamp wins — INCLUDING tombstones
+      // Tombstone stays in storage so other devices learn about deletion
+      mergedMonth[day] = cloudTs >= localTs ? cloudDay : localDay;
     });
 
-    // Clean up empty month
-    if (Object.keys(mergedMonth).length === 0) {
-      delete result[m];
-    } else {
-      result[m] = mergedMonth;
-    }
+    // Never delete empty months from storage
+    // (a month with only tombstones still needs to propagate)
+    result[m] = mergedMonth;
   });
 
   return result;

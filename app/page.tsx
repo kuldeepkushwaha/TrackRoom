@@ -19,6 +19,7 @@ interface DayData {
   did: string;
   timeLeak: string;
   updatedAt: number; 
+  deleted?:   boolean; 
 }
 type MonthData = Record<number, DayData>;
 type YearData = Record<string, MonthData>;
@@ -64,10 +65,15 @@ function getBestStreak(yd: YearData): number {
   return best;
 }
 function getMonthStats(yd: YearData, month: string) {
-  const data = Object.values(yd[month] || {});
-  const wins = data.filter(d => d.status === "succeed").length;
+  const clean = stripTombstones(yd);
+  const data  = Object.values(clean[month] || {});
+  const wins   = data.filter(d => d.status === "succeed").length;
   const losses = data.filter(d => d.status === "wasted").length;
-  return { wins, losses, rate: wins + losses > 0 ? Math.round((wins / (wins + losses)) * 100) : null };
+  return {
+    wins,
+    losses,
+    rate: wins + losses > 0 ? Math.round((wins / (wins + losses)) * 100) : null,
+  };
 }
 function getReality(wins: number, losses: number, streak: number, winRate: number, todayStatus?: string) {
   const total = wins + losses;
@@ -89,21 +95,62 @@ function mergeDayClient(
   if (!local && !cloud) return undefined;
   if (!local) return cloud;
   if (!cloud) return local;
-  // Newer timestamp wins
-  return (cloud.updatedAt || 0) >= (local.updatedAt || 0) ? cloud : local;
+
+  const localTs = local.updatedAt || 0;
+  const cloudTs = cloud.updatedAt || 0;
+
+  const winner = cloudTs >= localTs ? cloud : local;
+
+  // Tombstone wins → day is gone
+  if (winner.deleted) return undefined;
+
+  return winner;
 }
 
 function mergeYearDataClient(base: YearData, incoming: YearData): YearData {
   const result: YearData = { ...base };
+
   MONTHS.forEach((m) => {
     if (!incoming[m]) return;
     const mergedMonth: MonthData = { ...(result[m] || {}) };
+
     Object.keys(incoming[m]).forEach((dayStr) => {
       const day    = Number(dayStr);
       const merged = mergeDayClient(mergedMonth[day], incoming[m][day]);
-      if (merged) mergedMonth[day] = merged;
+
+      if (merged === undefined) {
+        delete mergedMonth[day]; // tombstone → erase
+      } else {
+        mergedMonth[day] = merged;
+      }
     });
-    result[m] = mergedMonth;
+
+    if (Object.keys(mergedMonth).length === 0) {
+      delete result[m];
+    } else {
+      result[m] = mergedMonth;
+    }
+  });
+
+  return result;
+}
+
+// ── Strip tombstones before any display logic ─────────────────────────────
+// Call this wherever you read yearData for display
+function stripTombstones(yd: YearData): YearData {
+  const result: YearData = {};
+  Object.keys(yd).forEach((m) => {
+    const cleanMonth: MonthData = {};
+    Object.keys(yd[m]).forEach((dayStr) => {
+      const day  = Number(dayStr);
+      const data = yd[m][day];
+      if (!data.deleted) {
+        cleanMonth[day] = data;
+      }
+    });
+    if (Object.keys(cleanMonth).length > 0) {
+      result[m] = cleanMonth;
+    }
   });
   return result;
 }
@@ -125,6 +172,7 @@ export default function Home() {
   const [showScrollTop, setShowScrollTop] = useState(false);
   const [leftPct, setLeftPct] = useState(DEFAULT_LEFT);
   const [isDragging, setIsDragging] = useState(false);
+  
 
 // Sync state
 const [syncKey, setSyncKey] = useState("");
@@ -614,34 +662,57 @@ const saveAudit = useCallback(() => {
     setMobileView("calendar");
   };
   // ── Reset only the selected day ────────────────────────────────────────────
-  const resetCurrentDay = () => {
-    if (!confirmReset) {
-      setConfirmReset(true);
-      setTimeout(() => setConfirmReset(false), 3000);
-      return;
-    }
+const resetCurrentDay = () => {
+  if (!confirmReset) {
+    setConfirmReset(true);
+    setTimeout(() => setConfirmReset(false), 3000);
+    return;
+  }
 
-    // Remove this day's entry completely from yearData
-    const updatedMonth = { ...(yearData[selectedMonth] || {}) };
-    delete updatedMonth[selectedDay];
+  setConfirmReset(false);
 
-    const updated = { ...yearData, [selectedMonth]: updatedMonth };
-
-    // Clean up empty month key
-    if (Object.keys(updatedMonth).length === 0) {
-      delete updated[selectedMonth];
-    }
-
-    persist(updated);
-
-    // Clear audit fields
-    setLearnedInput("");
-    setDidInput("");
-    setLeakInput("");
-    setConfirmReset(false);
-
-    addToast(`${selectedMonth} ${selectedDay} cleared.`, "info");
+  // ── Write a TOMBSTONE instead of just deleting ─────────────────────────
+  // This ensures other devices learn about the deletion via sync
+  const tombstone: DayData = {
+    status:    "wasted",   // placeholder — won't be shown
+    learned:   "",
+    did:       "",
+    timeLeak:  "",
+    updatedAt: Date.now(), // timestamp so merge knows this is intentional
+    deleted:   true,       // the tombstone flag
   };
+
+  setYearData(prev => {
+    const updatedMonth: MonthData = {
+      ...(prev[selectedMonth] || {}),
+      [selectedDay]: tombstone,
+    };
+
+    const next: YearData = {
+      ...prev,
+      [selectedMonth]: updatedMonth,
+    };
+
+    // Save locally — filter tombstones out of display in render
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(next));
+
+    // Push tombstone to cloud — merge on server will erase the day
+    const k  = localStorage.getItem("dsa-sync-key");
+    const pc = localStorage.getItem("dsa-app-passcode");
+    if (k && pc && !isInitialSync && !isSyncBlocked) {
+      syncToCloud(next, k, pc);
+    }
+
+    return next;
+  });
+
+  // Clear the audit fields
+  setLearnedInput("");
+  setDidInput("");
+  setLeakInput("");
+
+  addToast(`${selectedMonth} ${selectedDay} cleared on all devices.`, "info");
+};
   // ── Export JSON backup ─────────────────────────────────────────────────────
   const downloadBackup = () => {
     if (Object.keys(yearData).length === 0) {
@@ -736,6 +807,7 @@ const saveAudit = useCallback(() => {
     reader.readAsText(file);
   };
 
+  
 
   // ── Pull from cloud ────────────────────────────────────────────────────────
 const pullFromCloud = useCallback(async () => {
@@ -976,11 +1048,13 @@ useEffect(() => {
   </div>
 );
   // ── Computed stats ─────────────────────────────────────────────────────────
-  let globalWins = 0, globalLosses = 0;
-  Object.values(yearData).forEach(m => Object.values(m).forEach(d => {
-    if (d.status === "succeed") globalWins++;
-    if (d.status === "wasted") globalLosses++;
-  }));
+  
+  const displayData = stripTombstones(yearData);
+let globalWins = 0, globalLosses = 0;
+Object.values(displayData).forEach(m => Object.values(m).forEach(d => {
+  if (d.status === "succeed") globalWins++;
+  if (d.status === "wasted")  globalLosses++;
+}));
   const currentStreak = getCurrentStreak(yearData);
   const bestStreak = getBestStreak(yearData);
   const daysLeft = 365 - getDayOfYear();
@@ -988,9 +1062,8 @@ useEffect(() => {
   const winRate = totalMarked > 0 ? Math.round((globalWins / totalMarked) * 100) : 0;
   const todayStatus = yearData[TODAY_MONTH]?.[TODAY_DAY]?.status;
   const reality = getReality(globalWins, globalLosses, currentStreak, winRate, todayStatus);
-  const selectedDayData = yearData[selectedMonth]?.[selectedDay];
+const selectedDayData = displayData[selectedMonth]?.[selectedDay];
   const isSelectedToday = selectedMonth === TODAY_MONTH && selectedDay === TODAY_DAY;
-
   // ─────────────────────────────────────────────────────────────────────────
   return (
     <div className="h-screen flex flex-col bg-slate-950 text-slate-100 overflow-hidden">
@@ -1530,7 +1603,7 @@ useEffect(() => {
                     {Array.from({ length: offset }).map((_, i) => <div key={`b${i}`} />)}
 
                     {Array.from({ length: daysInMonth }, (_, i) => i + 1).map((day) => {
-                      const dayObj = yearData[month]?.[day];
+                     const dayObj    = displayData[month]?.[day];
                       const status = dayObj?.status;
                       const isToday = isNowMonth && day === TODAY_DAY;
                       const isSelected = selectedMonth === month && selectedDay === day;

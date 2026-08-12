@@ -9,6 +9,7 @@ interface DayData {
   did:       string;
   timeLeak:  string;
   updatedAt: number; // unix ms — used to resolve conflicts
+  deleted?:  boolean;
 }
 type MonthData = Record<number, DayData>;
 type YearData  = Record<string, MonthData>;
@@ -76,24 +77,47 @@ function mergeDayData(
   if (!local && !cloud) return undefined;
   if (!local) return cloud;
   if (!cloud) return local;
-  const localTs = local.updatedAt  || 0;
-  const cloudTs = cloud.updatedAt  || 0;
-  return cloudTs >= localTs ? cloud : local;
+
+  const localTs = local.updatedAt || 0;
+  const cloudTs = cloud.updatedAt || 0;
+
+  // Newer timestamp always wins — even if it's a deletion
+  const winner = cloudTs >= localTs ? cloud : local;
+
+  // If winner is a tombstone → return undefined (erases the day)
+  if (winner.deleted) return undefined;
+
+  return winner;
 }
 
 // Deep field-level merge of two YearData objects
 function mergeYearData(base: YearData, incoming: YearData): YearData {
   const result: YearData = { ...base };
+
   MONTHS.forEach((m) => {
     if (!incoming[m]) return;
     const mergedMonth: MonthData = { ...(result[m] || {}) };
+
     Object.keys(incoming[m]).forEach((dayStr) => {
-      const day = Number(dayStr);
+      const day    = Number(dayStr);
       const merged = mergeDayData(mergedMonth[day], incoming[m][day]);
-      if (merged) mergedMonth[day] = merged;
+
+      if (merged === undefined) {
+        // Tombstone won — remove the day entirely
+        delete mergedMonth[day];
+      } else {
+        mergedMonth[day] = merged;
+      }
     });
-    result[m] = mergedMonth;
+
+    // Clean up empty month
+    if (Object.keys(mergedMonth).length === 0) {
+      delete result[m];
+    } else {
+      result[m] = mergedMonth;
+    }
   });
+
   return result;
 }
 

@@ -563,89 +563,94 @@ export default function Home() {
       if (k && pc) syncToCloud(next, k, pc);
     }
   }, [isInitialSync, isSyncBlocked]); // eslint-disable-line react-hooks/exhaustive-deps
-  const updateStatus = useCallback((
-    month: string,
-    day: number,
-    status: "succeed" | "wasted"
-  ) => {
-    setYearData(prev => {
-      const existing = prev[month]?.[day] ??
-        { learned: "", did: "", timeLeak: "", updatedAt: 0 };
+const updateStatus = useCallback((
+  month:  string,
+  day:    number,
+  status: "succeed" | "wasted"
+) => {
+  setYearData(prev => {
+    const existing = prev[month]?.[day] ?? {
+      learned:   "",
+      did:       "",
+      timeLeak:  "",
+      updatedAt: 0,
+    };
 
-      const updated: DayData = {
-        ...existing,
-        status,
-        updatedAt: Date.now(), // ← timestamp every change
-      };
+    const updated: DayData = {
+      ...existing,
+      status,
+      updatedAt: Date.now(),
+      deleted:   false, // ← always explicitly clear tombstone on any mark
+    };
 
-      const next: YearData = {
-        ...prev,
-        [month]: { ...(prev[month] || {}), [day]: updated },
-      };
+    const next: YearData = {
+      ...prev,
+      [month]: { ...(prev[month] || {}), [day]: updated },
+    };
 
-      // Optimistic local save
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(next));
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(next));
 
-      // Sync with conflict-safe PATCH
-      const k = localStorage.getItem("dsa-sync-key");
-      const pc = localStorage.getItem("dsa-app-passcode");
-      if (k && pc && !isInitialSync && !isSyncBlocked) {
-        syncToCloud(next, k, pc);
-      }
+    const k  = localStorage.getItem("dsa-sync-key");
+    const pc = localStorage.getItem("dsa-app-passcode");
+    if (k && pc && !isInitialSync && !isSyncBlocked) {
+      syncToCloud(next, k, pc);
+    }
 
-      return next;
-    });
+    return next;
+  });
 
-    addToast(
-      status === "succeed"
-        ? `${month} ${day} → WIN ✓`
-        : `${month} ${day} → Wasted logged`,
-      status === "succeed" ? "success" : "error"
-    );
-  }, [isInitialSync, isSyncBlocked, addToast]); // eslint-disable-line react-hooks/exhaustive-deps
+  addToast(
+    status === "succeed"
+      ? `${month} ${day} → WIN ✓`
+      : `${month} ${day} → Wasted logged`,
+    status === "succeed" ? "success" : "error"
+  );
+}, [isInitialSync, isSyncBlocked, addToast]); // eslint-disable-line
+const saveAudit = useCallback(() => {
+  if (!selectedMonth || selectedDay === null) return;
 
-  const saveAudit = useCallback(() => {
-    if (!selectedMonth || selectedDay === null) return;
+  setYearData(prev => {
+    const existing = prev[selectedMonth]?.[selectedDay] ?? {
+      status:    "wasted" as const,
+      updatedAt: 0,
+    };
 
-    setYearData(prev => {
-      const existing = prev[selectedMonth]?.[selectedDay] ??
-        { status: "wasted" as const, updatedAt: 0 };
+    const updated: DayData = {
+      ...existing,
+      learned:   learnedInput,
+      did:       didInput,
+      timeLeak:  leakInput,
+      updatedAt: Date.now(),
+      deleted:   false, // ← always explicitly clear tombstone on save
+    };
 
-      const updated: DayData = {
-        ...existing,
-        learned: learnedInput,
-        did: didInput,
-        timeLeak: leakInput,
-        updatedAt: Date.now(), // ← timestamp every change
-      };
+    const next: YearData = {
+      ...prev,
+      [selectedMonth]: {
+        ...(prev[selectedMonth] || {}),
+        [selectedDay]: updated,
+      },
+    };
 
-      const next: YearData = {
-        ...prev,
-        [selectedMonth]: {
-          ...(prev[selectedMonth] || {}),
-          [selectedDay]: updated,
-        },
-      };
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(next));
 
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(next));
+    const k  = localStorage.getItem("dsa-sync-key");
+    const pc = localStorage.getItem("dsa-app-passcode");
+    if (k && pc && !isInitialSync && !isSyncBlocked) {
+      syncToCloud(next, k, pc);
+    }
 
-      const k = localStorage.getItem("dsa-sync-key");
-      const pc = localStorage.getItem("dsa-app-passcode");
-      if (k && pc && !isInitialSync && !isSyncBlocked) {
-        syncToCloud(next, k, pc);
-      }
+    return next;
+  });
 
-      return next;
-    });
-
-    setSaveState("saved");
-    addToast("Audit committed ✓", "success");
-    setTimeout(() => setSaveState("idle"), 2500);
-  }, [
-    selectedMonth, selectedDay,
-    learnedInput, didInput, leakInput,
-    isInitialSync, isSyncBlocked, addToast,
-  ]);
+  setSaveState("saved");
+  addToast("Audit committed ✓", "success");
+  setTimeout(() => setSaveState("idle"), 2500);
+}, [
+  selectedMonth, selectedDay,
+  learnedInput, didInput, leakInput,
+  isInitialSync, isSyncBlocked, addToast,
+]);
 
   const selectDay = useCallback((month: string, day: number, yd?: YearData) => {
     const data = yd || yearData;
@@ -664,57 +669,50 @@ export default function Home() {
     setMobileView("calendar");
   };
   // ── Reset only the selected day ────────────────────────────────────────────
-  const resetCurrentDay = () => {
-    if (!confirmReset) {
-      setConfirmReset(true);
-      setTimeout(() => setConfirmReset(false), 3000);
-      return;
-    }
+const resetCurrentDay = () => {
+  if (!confirmReset) {
+    setConfirmReset(true);
+    setTimeout(() => setConfirmReset(false), 3000);
+    return;
+  }
 
-    setConfirmReset(false);
+  setConfirmReset(false);
 
-    // ── Write a TOMBSTONE instead of just deleting ─────────────────────────
-    // This ensures other devices learn about the deletion via sync
-    const tombstone: DayData = {
-      status: "wasted",   // placeholder — won't be shown
-      learned: "",
-      did: "",
-      timeLeak: "",
-      updatedAt: Date.now(), // timestamp so merge knows this is intentional
-      deleted: true,       // the tombstone flag
-    };
+  const tombstone: DayData = {
+    status:    "wasted",
+    learned:   "",
+    did:       "",
+    timeLeak:  "",
+    updatedAt: Date.now(),
+    deleted:   true, // ← explicit tombstone
+  };
 
-    setYearData(prev => {
-      const updatedMonth: MonthData = {
+  setYearData(prev => {
+    const next: YearData = {
+      ...prev,
+      [selectedMonth]: {
         ...(prev[selectedMonth] || {}),
         [selectedDay]: tombstone,
-      };
+      },
+    };
 
-      const next: YearData = {
-        ...prev,
-        [selectedMonth]: updatedMonth,
-      };
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(next));
 
-      // Save locally — filter tombstones out of display in render
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(next));
+    const k  = localStorage.getItem("dsa-sync-key");
+    const pc = localStorage.getItem("dsa-app-passcode");
+    if (k && pc && !isInitialSync && !isSyncBlocked) {
+      syncToCloud(next, k, pc);
+    }
 
-      // Push tombstone to cloud — merge on server will erase the day
-      const k = localStorage.getItem("dsa-sync-key");
-      const pc = localStorage.getItem("dsa-app-passcode");
-      if (k && pc && !isInitialSync && !isSyncBlocked) {
-        syncToCloud(next, k, pc);
-      }
+    return next;
+  });
 
-      return next;
-    });
+  setLearnedInput("");
+  setDidInput("");
+  setLeakInput("");
 
-    // Clear the audit fields
-    setLearnedInput("");
-    setDidInput("");
-    setLeakInput("");
-
-    addToast(`${selectedMonth} ${selectedDay} cleared on all devices.`, "info");
-  };
+  addToast(`${selectedMonth} ${selectedDay} cleared on all devices.`, "info");
+};
   // ── Export JSON backup ─────────────────────────────────────────────────────
   const downloadBackup = () => {
     if (Object.keys(yearData).length === 0) {
